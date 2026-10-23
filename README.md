@@ -1,8 +1,8 @@
 # hearsay
 
-hearsay is the local speech engine for [gear](../gear): it hears, turning speech into text, and says, turning text into speech, in one small native build, on the CPU or, optionally, on the GPU through [Vulkan](https://www.vulkan.org/). It compiles only the parts of two upstream projects that gear uses against a single copy of the [ggml](https://github.com/ggml-org/ggml) tensor library:
+hearsay is the local speech engine for gear, a voice front-end for coding agents: it hears, turning speech into text, and says, turning text into speech, in one small native build, on the CPU or, optionally, on the GPU through [Vulkan](https://www.vulkan.org/). It compiles only the parts of two upstream projects that gear uses against a single copy of the [ggml](https://github.com/ggml-org/ggml) tensor library:
 
-- Hearing: NVIDIA's [Parakeet TDT-CTC 110M](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m) through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), with only its Parakeet family built, and optionally [Silero VAD](https://github.com/snakers4/silero-vad) from the same library, for telling speech from other sound.
+- Hearing: NVIDIA's Parakeet models, such as [Parakeet TDT-CTC 110M](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m), through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), with only its Parakeet family built, and optionally [Silero VAD](https://github.com/snakers4/silero-vad) from the same library, for telling speech from other sound.
 - Saying: Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) through [pockettts.cpp](https://github.com/ServeurpersoCom/pockettts.cpp), which streams audio as it is generated, without its command-line tool and HTTP server.
 
 Both projects are fetched at pinned commits and changed only by the patch files in `patches/`. The GPU build also fetches the Khronos [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) and [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) at pinned releases.
@@ -105,8 +105,20 @@ The models are [parakeet-tdt_ctc-110m-Q4_K_M.gguf](https://huggingface.co/handy-
 zig build -Doptimize=ReleaseFast -Dhear=true -Dsay=true -Dgpu=vulkan -Dtarget=x86_64-windows-gnu
 ```
 
-The compiled shaders make `hearsay-bench` 46 MB instead of 2.3 MB. On an RTX 3080 under Windows 11, Parakeet ft-v1 Q4_K_M transcribes 10 s of speech in 0.20 s against 2.97 s on one thread of a Ryzen 7 3800XT, and Pocket reaches first audio in 0.01 to 0.05 s, with word error rates on the 556 LibriSpeech utterances matching the CPU's to within rounding; [gear's README](../gear/README.md) has the full comparison. The CMake build is CPU only, and without Silero VAD.
+The compiled shaders make `hearsay-bench` 46 MB instead of 2.3 MB. On an RTX 3080 under Windows 11, Parakeet ft-v1 Q4_K_M transcribes 10 s of speech in 0.20 s against 2.97 s on one thread of a Ryzen 7 3800XT, and Pocket reaches first audio in 0.01 to 0.05 s, with word error rates on 556 LibriSpeech utterances matching the CPU's to within rounding. The CMake build is CPU only, and without Silero VAD.
 
-## Licenses
+## Limitations
 
-transcribe.cpp, pockettts.cpp and ggml are MIT-licensed. The Parakeet and Pocket TTS weights are CC-BY-4.0, and Kyutai's terms for Pocket TTS prohibit cloning a voice without consent and deceptive use.
+- Only the model families named above are built: Parakeet for recognition, Pocket TTS for synthesis and Silero for speech detection. Other transcribe.cpp families, and whisper.cpp-format `.bin` models other than Silero's, are not.
+- The GPU build supports Vulkan only, and needs glslc to build. The CMake build is CPU only and has no Silero option.
+- Speed and parity were measured on one machine, a Ryzen 7 3800XT, plus an RTX 3080 for the GPU figures.
+
+## Development checks
+
+`tests/smoke.sh` builds hearsay, downloads the Parakeet TDT-CTC 110M and Pocket TTS models into `.models` (or `$HEARSAY_MODELS`) at pinned commits, checks their SHA-256, and checks that Parakeet transcribes `tests/utterance.wav` and that Pocket speaks a sentence. Extra arguments go to `zig build`, such as `tests/smoke.sh -Dgpu=vulkan`. CI runs it on Linux, Windows and macOS, the Vulkan build on Linux (where, without a GPU, it falls back to the CPU), a cross-build for Windows from Linux, and the CMake build.
+
+## License
+
+hearsay's own files are under the MIT license in [LICENSE](LICENSE). The patches in `patches/` change files of transcribe.cpp (copyright the transcribe.cpp authors), pockettts.cpp (the pockettts.cpp authors) and ggml (the ggml authors), all MIT-licensed; their license texts come with the sources the build fetches. `tests/utterance.wav` is LibriSpeech test-clean utterance 1089-134686-0010, from [LibriSpeech](https://www.openslr.org/12), under CC-BY-4.0.
+
+The models are not part of hearsay. The Parakeet and Pocket TTS weights are CC-BY-4.0, and Kyutai's terms for Pocket TTS prohibit cloning a voice without consent and deceptive use; Silero VAD's are MIT.

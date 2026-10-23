@@ -1,0 +1,63 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Smoke test on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.17.0
+      - name: Keep the downloaded models between runs
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .models
+          key: models-${{ hashFiles('tests/smoke.sh') }}
+      - name: Transcribe and speak on the CPU
+        run: tests/smoke.sh
+      - name: Build for Windows from this system
+        if: runner.os == 'Linux'
+        run: zig build -Doptimize=ReleaseFast -Dhear=true -Dsay=true -Dsilero=true -Dtarget=x86_64-windows-gnu
+      - name: Install glslc, for the Vulkan build
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y glslc
+      - name: Transcribe and speak with the Vulkan build, which falls back to the CPU on a runner without a GPU
+        if: runner.os == 'Linux'
+        run: tests/smoke.sh -Dsilero=true -Dgpu=vulkan
+
+  cmake:
+    name: CMake build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DHEARSAY_HEAR=ON -DHEARSAY_SAY=ON
+          cmake --build build -j
+      - name: Run
+        run: build/hearsay-bench --help

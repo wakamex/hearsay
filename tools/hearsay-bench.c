@@ -30,6 +30,7 @@
 #include "dr_wav.h"
 #endif
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -237,9 +238,10 @@ int main(int argc, char ** argv) {
         return say(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
     }
 #endif
-    fprintf(stderr,
+    bool help = argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0);
+    fprintf(help ? stdout : stderr,
             "usage: %s hear MODEL THREADS LIST\n"
             "       %s say MODEL VOICES VOICE THREADS TEXTS OUT_PREFIX\n",
             argv[0], argv[0]);
-    return 2;
+    return help ? 0 : 2;
 }
