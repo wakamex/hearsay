@@ -38,7 +38,7 @@ Parity checks:
 | `patches/transcribe/0001-register-only-built-families.patch` | transcribe.cpp lists all 21 model families in one table, which would link every family. hearsay's copy lists only the families the build includes, Parakeet and Silero VAD. |
 | `patches/transcribe/0002-stdio-file-io.patch` | Replaces `std::ifstream` and `std::filesystem::status` in model loading with `ggml_fopen`, 64-bit `fseeko` / `_fseeki64` and `stat` / `GetFileAttributesW`, avoiding `std::locale` and `std::filesystem` in the linked binary while preserving UTF-8 path support on Windows. |
 | `patches/transcribe/0003-silero-stdio-file-io.patch` | The same change as 0002 for Silero VAD's reader of whisper.cpp-format `.bin` files, which used `std::ifstream` and the `path_from_utf8` that 0002 removes. |
-| `patches/ggml/0001` to `0003` | The three commits pockettts.cpp's ggml fork ([ServeurpersoCom/ggml](https://github.com/ServeurpersoCom/ggml)) adds to upstream ggml: a fused snake activation on the CPU and two `conv_1d` fixes for batched input. Both forks start from the same upstream ggml (`d7cb574` and its successor `ffa4e8b`, which changes only a release script), so these apply on top of transcribe.cpp's patched ggml. |
+| `patches/ggml/0001` to `0003` | The three commits pockettts.cpp's ggml fork ([ServeurpersoCom/ggml](https://github.com/ServeurpersoCom/ggml)) adds to upstream ggml, by Pascal and copied unchanged (see [License](#license)): a fused snake activation on the CPU and two `conv_1d` fixes for batched input. Both forks start from the same upstream ggml (`d7cb574` and its successor `ffa4e8b`, which changes only a release script), so these apply on top of transcribe.cpp's patched ggml. |
 | `patches/pockettts/0001-thread-count-from-POCKET_THREADS.patch` | Reads `POCKET_THREADS` for the CPU thread count instead of always using one thread per physical core, and skips `ggml_backend_load_all()` when `POCKET_STATIC` is defined so static builds do not scan the working directory for dynamic backend plugins. |
 | `patches/pockettts/0002-comma-before-every-chunk.patch` | Puts ", " before the text of every chunk. pockettts.cpp drops the audio of each chunk's first frame (80 ms), which decodes to a click, and when the voice starts at once a short first word goes with it: on 480 sentences opening with "I" (30 sentences, 16 seeds), the "I" was lost from 4.4% at the start of a text and 8.1% at the start of a later chunk, and from none of either with the comma, which adds about 0.08 s of quiet before each chunk's speech. A comma added to the text by the caller does not do this: Pocket can cut a long first sentence at it and voice it as a chunk of its own. |
 
@@ -68,6 +68,12 @@ zig build -Doptimize=ReleaseFast -Dhear=true -Dsay=true -Dtarget=aarch64-macos -
 ```
 
 This builds `zig-out/lib/libhearsay.a`, installs the enabled headers (`transcribe.h` and/or `pocket.h`, with `TRANSCRIBE_STATIC` and `POCKET_STATIC` defined) into `zig-out/include/`, and builds `zig-out/bin/hearsay-bench`. An app on [gesso](https://github.com/wakamex/gesso) such as gear can depend on hearsay in `build.zig.zon`, pass `.hear = true` and `.say = true` (or specific model flags such as `.parakeet = true`, `.pockettts = true`), and link the `hearsay` artifact:
+
+It is pinned by commit, so add it with:
+
+```sh
+zig fetch --save git+https://github.com/wakamex/hearsay#COMMIT
+```
 
 ```zig
 const hearsay = b.dependency("hearsay", .{
@@ -119,6 +125,10 @@ The compiled shaders make `hearsay-bench` 46 MB instead of 2.3 MB. On an RTX 308
 
 ## License
 
-hearsay's own files are under the MIT license in [LICENSE](LICENSE). The patches in `patches/` change files of transcribe.cpp (copyright the transcribe.cpp authors), pockettts.cpp (the pockettts.cpp authors) and ggml (the ggml authors), all MIT-licensed; their license texts come with the sources the build fetches. `tests/utterance.wav` is LibriSpeech test-clean utterance 1089-134686-0010, from [LibriSpeech](https://www.openslr.org/12), under CC-BY-4.0.
+hearsay's own files, and the patches in `patches/transcribe/` and `patches/pockettts/`, are under the MIT license in [LICENSE](LICENSE). The patches change files of transcribe.cpp, pockettts.cpp and ggml, which stay under their own MIT licenses; each patch folder holds the license of the project it patches (`patches/*/LICENSE`).
+
+`patches/ggml/0001` to `0003` are not hearsay's: Pascal (ServeurpersoCom), the author of pockettts.cpp, wrote them as commits [feece7e](https://github.com/ServeurpersoCom/ggml/commit/feece7e1581f752e204048af99a765a70d19bd50), [2eddaf9](https://github.com/ServeurpersoCom/ggml/commit/2eddaf94a8cdbbf1c30017d28313cd661a9da543) and [2be5947](https://github.com/ServeurpersoCom/ggml/commit/2be5947ac234d277714e824a5c7eb23880557543) in his ggml fork, [ServeurpersoCom/ggml](https://github.com/ServeurpersoCom/ggml). They are copied unchanged and are under ggml's MIT license.
+
+`tests/utterance.wav` is utterance 1089-134686-0010 of LibriSpeech test-clean, by Vassil Panayotov, Guoguo Chen, Daniel Povey and Sanjeev Khudanpur ([LibriSpeech](https://www.openslr.org/12), 2015), under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). It was converted from FLAC to a 16-bit WAV at its original 16 kHz, without trimming.
 
 The models are not part of hearsay. The Parakeet and Pocket TTS weights are CC-BY-4.0, and Kyutai's terms for Pocket TTS prohibit cloning a voice without consent and deceptive use; Silero VAD's are MIT.
