@@ -1,0 +1,27 @@
+.{
+    .name = .hearsay,
+    .version = "0.0.0",
+    .fingerprint = 0x1be0308888c755a8,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .transcribe = .{
+            .url = "https://github.com/handy-computer/transcribe.cpp/archive/90cd63d53b3103d137dcf463ec62338a66f56174.tar.gz",
+            .hash = "N-V-__8AAN-dhQWg1Vg5ujVA5Fwqh8ybu920LF3wp90WUVlT",
+        },
+        .pockettts = .{
+            .url = "https://github.com/ServeurpersoCom/pockettts.cpp/archive/6187e69a6b3badbfcc677cb71a846f28ca560f54.tar.gz",
+            .hash = "N-V-__8AAKdSJwB3IB7Nlr2TNaF3-VnrgqLp01SLt_bQFTry",
+        },
+        .vulkan_headers = .{
+            .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.341.tar.gz",
+            .hash = "N-V-__8AABJ5QgLfX-rcpaOGlg1YXcabW-m5cl5HEKkRsi3f",
+            .lazy = true,
+        },
+        .spirv_headers = .{
+            .url = "https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/vulkan-sdk-1.4.341.0.tar.gz",
+            .hash = "N-V-__8AAL3WPACjJ68w-42pC9p4-xZRqOcpR2i6CYOMfMK7",
+            .lazy = true,
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "patches", "README.md" },
+}

@@ -1,0 +1,269 @@
+diff --git a/src/transcribe-load-common.cpp b/src/transcribe-load-common.cpp
+index 0f17b856..837910ea 100644
+--- a/src/transcribe-load-common.cpp
++++ b/src/transcribe-load-common.cpp
+@@ -22,8 +22,6 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+-#include <fstream>
+-#include <ios>
+ #include <stdexcept>
+ #include <vector>
+ 
+@@ -444,11 +442,7 @@ transcribe_status stream_tensor_data(const std::string &  path,
+                                      const gguf_context * gguf_data,
+                                      ggml_context *       ctx_meta,
+                                      const char *         error_tag) {
+-    // std::ifstream rather than going through gguf's loader a third
+-    // time: ifstream::seekg takes a streamoff (signed 64-bit on every
+-    // platform we target), so multi-GB tensor offsets work without
+-    // #ifdef'ing fseeko vs _fseeki64.
+-    std::ifstream fin(path_from_utf8(path), std::ios::binary);
++    BinaryFile fin(path);
+     if (!fin) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: failed to reopen %s for tensor data", error_tag, path.c_str());
+         return TRANSCRIBE_ERR_GGUF;
+@@ -466,10 +460,8 @@ transcribe_status stream_tensor_data(const std::string &  path,
+         const size_t toffset = gguf_get_tensor_offset(gguf_data, idx);
+         const size_t nbytes  = ggml_nbytes(t);
+ 
+-        const std::streamoff abs_offset =
+-            static_cast<std::streamoff>(data_offset) + static_cast<std::streamoff>(toffset);
+-        fin.seekg(abs_offset);
+-        if (!fin) {
++        const int64_t abs_offset = static_cast<int64_t>(data_offset) + static_cast<int64_t>(toffset);
++        if (!fin.seek(abs_offset)) {
+             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: seek failed for tensor \"%s\"", error_tag, t->name);
+             return TRANSCRIBE_ERR_GGUF;
+         }
+@@ -477,8 +469,7 @@ transcribe_status stream_tensor_data(const std::string &  path,
+         if (staging.size() < nbytes) {
+             staging.resize(nbytes);
+         }
+-        fin.read(reinterpret_cast<char *>(staging.data()), static_cast<std::streamsize>(nbytes));
+-        if (!fin) {
++        if (fin.read(staging.data(), nbytes) != nbytes) {
+             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: short read for tensor \"%s\" (%zu bytes)", error_tag, t->name,
+                     nbytes);
+             return TRANSCRIBE_ERR_GGUF;
+@@ -640,28 +631,27 @@ ReadF32Result read_f32_tensor_checked(gguf_context *       gguf_ctx,
+     const size_t data_off = gguf_get_data_offset(gguf_ctx);
+     const size_t t_off    = gguf_get_tensor_offset(gguf_ctx, idx);
+ 
+-    std::ifstream fin(path_from_utf8(gguf_path), std::ios::binary);
++    BinaryFile fin(gguf_path);
+     if (!fin) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: failed to open %s for tensor \"%s\"", error_tag, gguf_path.c_str(),
+                 tensor_name);
+         return ReadF32Result::ReadErr;
+     }
+ 
+-    const std::streamoff abs_offset = static_cast<std::streamoff>(data_off) + static_cast<std::streamoff>(t_off);
+-    fin.seekg(abs_offset);
+-    if (!fin) {
++    const int64_t abs_offset = static_cast<int64_t>(data_off) + static_cast<int64_t>(t_off);
++    if (!fin.seek(abs_offset)) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: seek failed for tensor \"%s\"", error_tag, tensor_name);
+         return ReadF32Result::ReadErr;
+     }
+ 
+     out.resize(n_elems);
+-    fin.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(nbytes));
++    const size_t got = fin.read(out.data(), nbytes);
+ 
+-    if (!fin || static_cast<size_t>(fin.gcount()) != nbytes) {
++    if (got != nbytes) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                 "%s: short read for tensor \"%s\" "
+                 "(got %zu of %zu bytes)",
+-                error_tag, tensor_name, static_cast<size_t>(fin.gcount()), nbytes);
++                error_tag, tensor_name, got, nbytes);
+         out.clear();
+         return ReadF32Result::ReadErr;
+     }
+diff --git a/src/transcribe-path.h b/src/transcribe-path.h
+index 8faec1b3..73bb660c 100644
+--- a/src/transcribe-path.h
++++ b/src/transcribe-path.h
+@@ -14,27 +14,26 @@
+ 
+ #pragma once
+ 
+-#include <filesystem>
+-#include <string>
+-#include <system_error>
++#include "ggml.h"
+ 
+-namespace transcribe {
++#include <cerrno>
++#include <cstdint>
++#include <cstdio>
++#include <string>
+ 
+-// Build a std::filesystem::path from UTF-8 bytes. On Windows this
+-// converts to the native wide encoding; elsewhere the narrow encoding
+-// IS UTF-8 and this is a passthrough. (fs::u8path is the C++17
+-// spelling; it is deprecated-but-present under C++20.)
+-inline std::filesystem::path path_from_utf8(const char * utf8) {
+ #if defined(_WIN32)
+-    return std::filesystem::u8path(utf8);
++#    ifndef WIN32_LEAN_AND_MEAN
++#        define WIN32_LEAN_AND_MEAN
++#    endif
++#    ifndef NOMINMAX
++#        define NOMINMAX
++#    endif
++#    include <windows.h>
+ #else
+-    return std::filesystem::path(utf8);
++#    include <sys/stat.h>
+ #endif
+-}
+ 
+-inline std::filesystem::path path_from_utf8(const std::string & utf8) {
+-    return path_from_utf8(utf8.c_str());
+-}
++namespace transcribe {
+ 
+ // Existence pre-check whose ONLY job is to distinguish "the file is
+ // not at this path" from every other reason a subsequent open might
+@@ -45,13 +44,55 @@ inline std::filesystem::path path_from_utf8(const std::string & utf8) {
+ // open will surface a more accurate error than FILE_NOT_FOUND.
+ //
+ // Deliberately only the not-found outcome (ENOENT / ENOTDIR and their
+-// Windows equivalents, which fs::status maps to file_type::not_found)
+-// reports absence. Other failures (EACCES, ELOOP, EIO, ...) don't
+-// prove the file is missing — only that we can't reach it — so they
+-// return true and the caller's open reports the real error.
++// Windows equivalents) reports absence. Other failures (EACCES, ELOOP,
++// EIO, ...) don't prove the file is missing — only that we can't reach
++// it — so they return true and the caller's open reports the real error.
+ inline bool path_is_present(const char * utf8_path) {
+-    std::error_code ec;
+-    return std::filesystem::status(path_from_utf8(utf8_path), ec).type() != std::filesystem::file_type::not_found;
++#if defined(_WIN32)
++    int n = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, nullptr, 0);
++    if (n <= 0) {
++        return false;
++    }
++    std::wstring wpath(static_cast<size_t>(n), L'\0');
++    MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath.data(), n);
++    if (GetFileAttributesW(wpath.c_str()) != INVALID_FILE_ATTRIBUTES) {
++        return true;
++    }
++    const DWORD err = GetLastError();
++    return err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND;
++#else
++    struct stat st{};
++    return stat(utf8_path, &st) == 0 || (errno != ENOENT && errno != ENOTDIR);
++#endif
+ }
+ 
++struct BinaryFile {
++    FILE * fp = nullptr;
++
++    explicit BinaryFile(const char * utf8_path) : fp(ggml_fopen(utf8_path, "rb")) {}
++    explicit BinaryFile(const std::string & utf8_path) : BinaryFile(utf8_path.c_str()) {}
++    ~BinaryFile() {
++        if (fp != nullptr) {
++            std::fclose(fp);
++        }
++    }
++
++    BinaryFile(const BinaryFile &)             = delete;
++    BinaryFile & operator=(const BinaryFile &) = delete;
++
++    explicit operator bool() const { return fp != nullptr; }
++
++    bool seek(int64_t offset) {
++#if defined(_WIN32)
++        return fp != nullptr && _fseeki64(fp, offset, SEEK_SET) == 0;
++#else
++        return fp != nullptr && fseeko(fp, static_cast<off_t>(offset), SEEK_SET) == 0;
++#endif
++    }
++
++    size_t read(void * dst, size_t nbytes) {
++        return fp != nullptr ? std::fread(dst, 1, nbytes, fp) : 0;
++    }
++};
++
+ }  // namespace transcribe
+diff --git a/src/transcribe.cpp b/src/transcribe.cpp
+index 0525619c..238ecc59 100644
+--- a/src/transcribe.cpp
++++ b/src/transcribe.cpp
+@@ -54,9 +54,9 @@
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+-#include <filesystem>
+-#include <fstream>
+-#include <ios>
++#if defined(TRANSCRIBE_GGML_BACKEND_DL)
++#    include <filesystem>
++#endif
+ #include <mutex>
+ #include <set>
+ #include <string>
+@@ -762,9 +762,12 @@ static transcribe_status transcribe_init_backends_impl(const char * artifact_dir
+     if (artifact_dir == nullptr || artifact_dir[0] == '\0') {
+         return TRANSCRIBE_ERR_INVALID_ARG;
+     }
++#if !defined(TRANSCRIBE_GGML_BACKEND_DL)
++    return TRANSCRIBE_OK;
++#else
+     {
+         std::error_code ec;
+-        if (!std::filesystem::is_directory(transcribe::path_from_utf8(artifact_dir), ec)) {
++        if (!std::filesystem::is_directory(std::filesystem::u8path(artifact_dir), ec)) {
+             transcribe::log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "transcribe_init_backends: %s is not an existing directory",
+                                 artifact_dir);
+             return TRANSCRIBE_ERR_FILE_NOT_FOUND;
+@@ -779,7 +782,7 @@ static transcribe_status transcribe_init_backends_impl(const char * artifact_dir
+     std::lock_guard<std::mutex>  lock(s_mutex);
+ 
+     std::error_code       ec;
+-    std::filesystem::path canonical = std::filesystem::weakly_canonical(transcribe::path_from_utf8(artifact_dir), ec);
++    std::filesystem::path canonical = std::filesystem::weakly_canonical(std::filesystem::u8path(artifact_dir), ec);
+     const std::string     key       = ec ? std::string(artifact_dir) : canonical.u8string();
+     if (s_loaded_dirs.find(key) == s_loaded_dirs.end()) {
+         ggml_backend_load_all_from_path(artifact_dir);
+@@ -820,6 +823,7 @@ static transcribe_status transcribe_init_backends_impl(const char * artifact_dir
+         return TRANSCRIBE_ERR_BACKEND;
+     }
+     return TRANSCRIBE_OK;
++#endif
+ }
+ 
+ static transcribe_status transcribe_init_backends_default_impl(void) {
+@@ -1058,7 +1062,7 @@ static transcribe_status transcribe_model_load_file_impl(const char *
+     uint32_t magic      = 0;
+     bool     silero_bin = false;
+     {
+-        std::ifstream fin(transcribe::path_from_utf8(path), std::ios::binary);
++        transcribe::BinaryFile fin(path);
+         if (!fin) {
+             // The existence pre-check said the path is reachable but
+             // the open failed — permissions / type issue. Treat as a generic
+@@ -1066,7 +1070,7 @@ static transcribe_status transcribe_model_load_file_impl(const char *
+             return TRANSCRIBE_ERR_GGUF;
+         }
+         uint8_t bytes[4];
+-        if (!fin.read(reinterpret_cast<char *>(bytes), sizeof(bytes))) {
++        if (fin.read(bytes, sizeof(bytes)) != sizeof(bytes)) {
+             return TRANSCRIBE_ERR_GGUF;
+         }
+         magic = uint32_t(bytes[0]) | uint32_t(bytes[1]) << 8 | uint32_t(bytes[2]) << 16 | uint32_t(bytes[3]) << 24;
+@@ -1074,8 +1078,8 @@ static transcribe_status transcribe_model_load_file_impl(const char *
+             // A bounded tag sniff, never an extension check. Whisper's first
+             // hparam can equal 10, so require the complete Silero tag as well.
+             char tag[sizeof("silero-16k") - 1];
+-            if (fin.read(reinterpret_cast<char *>(bytes), sizeof(bytes)) && bytes[0] == sizeof(tag) && bytes[1] == 0 &&
+-                bytes[2] == 0 && bytes[3] == 0 && fin.read(tag, sizeof(tag))) {
++            if (fin.read(bytes, sizeof(bytes)) == sizeof(bytes) && bytes[0] == sizeof(tag) && bytes[1] == 0 &&
++                bytes[2] == 0 && bytes[3] == 0 && fin.read(tag, sizeof(tag)) == sizeof(tag)) {
+                 silero_bin = std::memcmp(tag, "silero-16k", sizeof(tag)) == 0;
+             }
+         }

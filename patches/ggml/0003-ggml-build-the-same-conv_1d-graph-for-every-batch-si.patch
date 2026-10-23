@@ -1,0 +1,36 @@
+From 2be5947ac234d277714e824a5c7eb23880557543 Mon Sep 17 00:00:00 2001
+From: Pascal <admin@serveurperso.com>
+Date: Wed, 14 Oct 2026 09:20:01 +0200
+Subject: [PATCH 3/3] ggml: build the same conv_1d graph for every batch size
+
+Address review from ggerganov: drop the N == 1 branch of ggml_conv_1d.
+The GEMM result is always reshaped to [OC, N, OL] and permuted back,
+as ggml_conv_2d does, so every batch size builds the same graph. For
+N == 1 this adds a cont on an already ordered tensor.
+---
+ src/ggml.c | 9 ++-------
+ 1 file changed, 2 insertions(+), 7 deletions(-)
+
+diff --git a/src/ggml.c b/src/ggml.c
+index 04136a7..3092b78 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -4636,13 +4636,8 @@ struct ggml_tensor * ggml_conv_1d(
+                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
+                 ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
+ 
+-    // Restore [OL, OC, N] from the flattened GEMM output.
+-    if (im2col->ne[2] == 1) {
+-        result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], 1);                     // [OL, OC, 1]
+-    } else {
+-        result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]);         // [OL, N, OC]
+-        result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));                        // [OL, OC, N]
+-    }
++    result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]); // [OC, N, OL]
++    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));                // [N, OC, OL]
+ 
+     return result;
+ }
+-- 
+2.56.0
+

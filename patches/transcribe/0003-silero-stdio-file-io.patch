@@ -1,0 +1,90 @@
+--- a/src/arch/silero_vad/model.cpp
++++ b/src/arch/silero_vad/model.cpp
+@@ -20,7 +20,6 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstring>
+-#include <fstream>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -254,23 +253,31 @@
+ constexpr size_t k_bin_count = sizeof(k_bin_tensors) / sizeof(k_bin_tensors[0]);
+ 
+ struct BinReader {
+-    std::ifstream file;
+-    int64_t       remaining;
+-
+-    explicit BinReader(const char * path) :
+-        file(path_from_utf8(path), std::ios::binary | std::ios::ate),
+-        remaining(-1) {
+-        if (file) {
+-            remaining = static_cast<int64_t>(file.tellg());
+-            file.seekg(0);
+-        }
++    BinaryFile file;
++    int64_t    remaining;
++
++    explicit BinReader(const char * path) : file(path), remaining(-1) {
++        if (file && std::fseek(file.fp, 0, SEEK_END) == 0) {
++            remaining = tell();
++            if (remaining < 0 || !file.seek(0)) {
++                remaining = -1;
++            }
++        }
++    }
++
++    int64_t tell() {
++#if defined(_WIN32)
++        return _ftelli64(file.fp);
++#else
++        return static_cast<int64_t>(ftello(file.fp));
++#endif
+     }
+ 
+     bool bytes(void * out, size_t n) {
+         if (remaining < 0 || n > static_cast<uint64_t>(remaining)) {
+             return false;
+         }
+-        if (!file.read(static_cast<char *>(out), static_cast<std::streamsize>(n))) {
++        if (file.read(out, n) != n) {
+             return false;
+         }
+         remaining -= static_cast<int64_t>(n);
+@@ -322,10 +329,10 @@
+     }
+ 
+     struct Record {
+-        std::streampos offset{};
+-        size_t         count = 1;
+-        uint32_t       type  = 0;
+-        bool           seen  = false;
++        int64_t  offset = 0;
++        size_t   count  = 1;
++        uint32_t type   = 0;
++        bool     seen   = false;
+     } records[k_bin_count];
+ 
+     // First pass checks exact ranks/shapes and all payload bounds. Multiplication
+@@ -373,9 +380,8 @@
+         }
+         rec.seen   = true;
+         rec.type   = type;
+-        rec.offset = r.file.tellg();
+-        r.file.seekg(static_cast<std::streamoff>(bytes), std::ios::cur);
+-        if (!r.file) {
++        rec.offset = r.tell();
++        if (rec.offset < 0 || !r.file.seek(rec.offset + static_cast<int64_t>(bytes))) {
+             return bad();
+         }
+         r.remaining -= static_cast<int64_t>(bytes);
+@@ -434,8 +440,7 @@
+     for (size_t i = 0; i < k_bin_count; ++i) {
+         const Record & rec   = records[i];
+         const size_t   bytes = rec.count * (rec.type == 0 ? 4 : 2);
+-        r.file.seekg(rec.offset);
+-        r.remaining = static_cast<int64_t>(bytes);
++        r.remaining = r.file.seek(rec.offset) ? static_cast<int64_t>(bytes) : -1;
+         std::vector<uint8_t> raw(bytes);
+         std::vector<float>   values(rec.count);
+         if (!r.bytes(raw.data(), bytes)) {

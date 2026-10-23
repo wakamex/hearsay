@@ -1,0 +1,33 @@
+diff --git a/src/backend.h b/src/backend.h
+index a3aa457..f570840 100644
+--- a/src/backend.h
++++ b/src/backend.h
+@@ -12,11 +12,18 @@
+ #include <cstring>
+ #include <mutex>
+ #include <string>
++#include <cstdlib>
+ #include <thread>
+ 
+ // One thread per physical core (logical / 2 for HT/SMT): GEMM shares the
+ // SIMD units across hyperthreads.
+ static int backend_cpu_n_threads(void) {
++    if (const char * e = std::getenv("POCKET_THREADS")) {
++        int t = std::atoi(e);
++        if (t > 0) {
++            return t;
++        }
++    }
+     int n = (int) std::thread::hardware_concurrency() / 2;
+     return n > 0 ? n : 1;
+ }
+@@ -56,7 +63,9 @@ static void pt_ggml_log(enum ggml_log_level level, const char * text, void * use
+ static void backend_load(void) {
+     static const bool loaded = [] {
+         ggml_log_set(pt_ggml_log, nullptr);
++#ifndef POCKET_STATIC
+         ggml_backend_load_all();
++#endif
+         return true;
+     }();
+     (void) loaded;

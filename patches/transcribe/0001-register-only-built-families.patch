@@ -1,0 +1,20 @@
+--- a/src/transcribe-arch.cpp
++++ b/src/transcribe-arch.cpp
+@@ -104,11 +104,13 @@
+     }
+ 
+     static const Arch * const k_archs[] = {
+-        &parakeet::arch,         &cohere::arch,      &canary::arch,     &qwen3_asr::arch,    &voxtral::arch,
+-        &voxtral_realtime::arch, &canary_qwen::arch, &whisper::arch,    &moonshine::arch,    &moonshine_streaming::arch,
+-        &sensevoice::arch,       &funasr_nano::arch, &gigaam::arch,     &granite::arch,      &granite_nar::arch,
+-        &medasr::arch,           &moss::arch,        &sortformer::arch, &granite5_ctc::arch, &ecapa_tdnn::arch,
++// hearsay builds only the families it is asked for (build.zig defines these)
++#ifdef HEARSAY_PARAKEET
++        &parakeet::arch,
++#endif
++#ifdef HEARSAY_SILERO
+         &silero_vad::arch,
++#endif
+     };
+     constexpr size_t k_n = sizeof(k_archs) / sizeof(k_archs[0]);
+ 

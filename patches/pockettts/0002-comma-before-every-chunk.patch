@@ -1,0 +1,12 @@
+--- a/src/pocket.cpp
++++ b/src/pocket.cpp
+@@ -613,6 +613,9 @@
+         std::string text;
+         int         guess = 1;
+         tp_prepare(hp, chunks[ci], &text, &guess);
++        // hearsay: a comma before every chunk, so speech starts after the first frame, whose
++        // audio is dropped; without it a short first word such as "I" is lost with that frame.
++        text = ", " + text;
+         std::vector<int>     ids = tok_encode(c->tok, text);
+         std::vector<int32_t> ids32(ids.begin(), ids.end());
+         const int            ntok    = (int) ids.size();
