@@ -9,7 +9,7 @@ The projects are fetched at pinned commits and changed only by the patch files i
 
 ## Result
 
-The combined build matches the two projects built separately and is less than a third of their combined size. One benchmark program holding both engines and ggml is 2.3 MB stripped, against 4.7 MB for transcribe.cpp's command-line program and 2.4 MB for pockettts.cpp's. Every transcript is identical to upstream transcribe.cpp's, and synthesis was bit-identical to upstream pockettts.cpp's when built with the same ggml kernels, before `patches/pockettts/0002` put a comma before every chunk. With the kernels hearsay uses, Pocket gets faster: 0.22 s to first audio instead of 0.29 s on one thread, and 0.50 CPU-seconds per second of audio instead of 0.63. Recognition costs 1.4% more CPU than upstream transcribe.cpp.
+The combined build matches the two projects built separately and is less than a third of their combined size. One benchmark program holding both engines and ggml is 2.3 MB stripped, against 4.7 MB for transcribe.cpp's command-line program and 2.4 MB for pockettts.cpp's. Every Parakeet transcript is identical to upstream transcribe.cpp's, and synthesis was bit-identical to upstream pockettts.cpp's when built with the same ggml kernels, before `patches/pockettts/0002` put a comma before every chunk. With the kernels hearsay uses, Pocket gets faster: 0.22 s to first audio instead of 0.29 s on one thread, and 0.50 CPU-seconds per second of audio instead of 0.63. Recognition costs 1.4% more CPU than upstream transcribe.cpp.
 
 ## Measured against the separate builds
 
@@ -30,6 +30,31 @@ Parity checks:
 
 - Hearing: all 556 transcripts from every tenth utterance of LibriSpeech test-clean and test-other are identical to upstream transcribe.cpp at the same commit.
 - Saying (before `patches/pockettts/0002`, which changes the text Pocket reads): with llamafile's kernels off, all 8 replies are bit-identical to upstream pockettts.cpp with the same model, voice and seed. With them on, four replies differ by at most 110 in 32,767, and the other four diverge after their first seconds. Pocket feeds each sampled 80 ms frame into the next, so the rounding difference from the other matrix kernels changes the rest of the sample; both are valid samples of the same text.
+
+## Whisper and Qwen3-TTS against the separate builds
+
+These rows compare `-Dwhisper` and `-Dqwentts` with upstream transcribe.cpp and qwentts.cpp built on their own at the same commits, each with its own ggml, on the same idle Ryzen 7 3800XT under WSL2 with 8 threads. Whisper transcribes the same 57 LibriSpeech utterances (460 s) in English, upstream through `transcribe-cli --batch`. Qwen3-TTS clones a voice from `tests/utterance.wav`, resampled to 24 kHz, with its transcript as the reference text, and synthesizes gear's 8 agent-style replies with seed 42, both builds through `hearsay-bench qwen` (upstream's linked against its own libraries), timing the second pass. All models are Q8_0, the Qwen3-TTS talkers with the Q8_0 12 Hz tokenizer.
+
+| Model | Build | Wall time for the 57 utterances | Speed vs real time | First audio, median (worst) | Peak memory |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Whisper base | transcribe.cpp alone | 37 s | | | 0.19 GB |
+| Whisper base | hearsay | 39 s | | | 0.20 GB |
+| Whisper large-v3-turbo | transcribe.cpp alone | 481 s | | | 1.02 GB |
+| Whisper large-v3-turbo | hearsay | 534 s | | | 1.01 GB |
+| Qwen3-TTS 1.7B base | qwentts.cpp alone | | 0.43x | 1.64 s (2.00 s) | 6.0 GB |
+| Qwen3-TTS 1.7B base | hearsay | | 0.47x | 1.79 s (1.88 s) | 6.0 GB |
+| Qwen3-TTS 0.6B base | qwentts.cpp alone | | 0.58x | 1.14 s (1.18 s) | 3.9 GB |
+| Qwen3-TTS 0.6B base | hearsay | | 0.59x | 1.31 s (1.38 s) | 3.9 GB |
+
+Whisper times are the mean of two alternating runs per build, which agreed to within 2%. Whisper is 5% (base) to 11% (large-v3-turbo) slower in hearsay; the cause is not yet known. Neither engine runs in real time on this CPU at these sizes.
+
+Parity checks:
+
+- Whisper: large-v3-turbo's transcripts match upstream's on 55 of the 57 utterances and base's on 50. Each build gives the same transcripts on every run except for one utterance with base, which both builds garble and which changes between runs because Whisper's temperature fallback samples from a random seed. The differences are single words, such as "Hester Prin" for upstream's "Hester print", or punctuation. hearsay links upstream's code unchanged and matches the build settings: with hearsay-bench linked against upstream's own library, the transcripts are upstream's. The differences come from how hearsay compiles transcribe.cpp's own code for the native CPU, where upstream compiles it for baseline x86-64: turning off fused multiply-adds there removes two of the six differences on base. The `conv_1d` patches, `GGML_MAX_NAME` and the compiler (clang or GCC for upstream) change nothing.
+- Whisper `.bin`: whisper.cpp's tiny.en `.bin` file transcribes `tests/utterance.wav` as upstream does.
+- Qwen3-TTS: the same seed gives different audio from the two builds, as with Pocket: each sampled frame feeds the next, and qwentts.cpp's own ggml (0.27.0, built with OpenMP) rounds differently from hearsay's. Both are valid samples of the same text: Whisper large-v3-turbo transcribes the 8 replies from hearsay's build with 2.7% (0.6B) and 3.6% (1.7B) word errors against the texts, and from upstream's with 4.1% and 3.2%, nearly all of them number and spelling forms such as "11" for "eleven" and "Mac OS".
+
+Size: a `hearsay-bench` with only Whisper is 2.1 MB stripped, with only Qwen3-TTS 2.1 MB, and with Parakeet, Whisper, Pocket TTS and Qwen3-TTS 3.0 MB.
 
 ## Changes to upstream
 
