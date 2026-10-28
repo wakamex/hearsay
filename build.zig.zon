@@ -23,5 +23,5 @@
             .lazy = true,
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "patches", "README.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools", "patches", "README.md", "LICENSE" },
 }
