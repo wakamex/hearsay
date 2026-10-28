@@ -38,7 +38,7 @@ jobs:
         run: tests/smoke.sh
       - name: Build for Windows from this system
         if: runner.os == 'Linux'
-        run: zig build -Doptimize=ReleaseFast -Dhear=true -Dsay=true -Dsilero=true -Dtarget=x86_64-windows-gnu
+        run: zig build -Doptimize=ReleaseFast -Dhear=true -Dsay=true -Dsilero=true -Dwhisper=true -Dqwentts=true -Dtarget=x86_64-windows-gnu
       - name: Install glslc, for the Vulkan build
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y glslc

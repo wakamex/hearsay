@@ -1,0 +1,130 @@
+diff --git a/src/transcribe-bin-loader.cpp b/src/transcribe-bin-loader.cpp
+index bd95d43..feb8619 100644
+--- a/src/transcribe-bin-loader.cpp
++++ b/src/transcribe-bin-loader.cpp
+@@ -7,10 +7,9 @@
+ #include "transcribe-log.h"
+ #include "transcribe-path.h"
+ 
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+-#include <fstream>
+-#include <ios>
+ 
+ namespace transcribe::bin_loader {
+ 
+@@ -20,9 +19,16 @@ constexpr const char * kTag = "whisper-bin";
+ 
+ // Read sizeof(T) bytes into `out`. Returns false on short read or
+ // stream failure.
+-template <typename T> bool read_pod(std::ifstream & fin, T & out) {
+-    fin.read(reinterpret_cast<char *>(&out), sizeof(T));
+-    return static_cast<bool>(fin);
++template <typename T> bool read_pod(BinaryFile & fin, T & out) {
++    return fin.read(&out, sizeof(T)) == sizeof(T);
++}
++
++int64_t tell(BinaryFile & fin) {
++#if defined(_WIN32)
++    return _ftelli64(fin.fp);
++#else
++    return static_cast<int64_t>(ftello(fin.fp));
++#endif
+ }
+ 
+ // Map `ftype % 1000` (the GGML_FTYPE_* enum) to a ggml_type. Whisper
+@@ -141,7 +147,7 @@ transcribe_status parse_whisper_bin(const char * path, WhisperBinModel & out) {
+     }
+     out.path = path;
+ 
+-    std::ifstream fin(path_from_utf8(path), std::ios::binary);
++    BinaryFile fin(path);
+     if (!fin) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: failed to open %s", kTag, path);
+         return TRANSCRIBE_ERR_GGUF;
+@@ -223,9 +229,7 @@ transcribe_status parse_whisper_bin(const char * path, WhisperBinModel & out) {
+     }
+     const size_t fb_elems = static_cast<size_t>(out.n_mel_filters) * static_cast<size_t>(out.n_fft_filters);
+     out.mel_filterbank.resize(fb_elems);
+-    fin.read(reinterpret_cast<char *>(out.mel_filterbank.data()),
+-             static_cast<std::streamsize>(fb_elems * sizeof(float)));
+-    if (!fin) {
++    if (fin.read(out.mel_filterbank.data(), fb_elems * sizeof(float)) != fb_elems * sizeof(float)) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: short read on mel filterbank (%zu floats)", kTag, fb_elems);
+         return TRANSCRIBE_ERR_GGUF;
+     }
+@@ -259,8 +263,7 @@ transcribe_status parse_whisper_bin(const char * path, WhisperBinModel & out) {
+         }
+         scratch.assign(static_cast<size_t>(len), '\0');
+         if (len > 0) {
+-            fin.read(scratch.data(), static_cast<std::streamsize>(len));
+-            if (!fin) {
++            if (fin.read(scratch.data(), len) != len) {
+                 log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: short read on vocab token %d body", kTag, i);
+                 return TRANSCRIBE_ERR_GGUF;
+             }
+@@ -277,11 +280,11 @@ transcribe_status parse_whisper_bin(const char * path, WhisperBinModel & out) {
+         // Peek for EOF by attempting to read n_dims. If the read
+         // fails cleanly at EOF (no partial bytes), we're done.
+         int32_t n_dims = 0;
+-        fin.read(reinterpret_cast<char *>(&n_dims), sizeof(n_dims));
+-        if (fin.eof() && fin.gcount() == 0) {
++        const size_t got = fin.read(&n_dims, sizeof(n_dims));
++        if (got == 0 && std::feof(fin.fp)) {
+             break;
+         }
+-        if (!fin || fin.gcount() != sizeof(n_dims)) {
++        if (got != sizeof(n_dims)) {
+             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: truncated tensor header (after %zu tensors)", kTag,
+                     out.tensors.size());
+             return TRANSCRIBE_ERR_GGUF;
+@@ -333,8 +336,7 @@ transcribe_status parse_whisper_bin(const char * path, WhisperBinModel & out) {
+         }
+ 
+         std::string name(static_cast<size_t>(name_len), '\0');
+-        fin.read(name.data(), name_len);
+-        if (!fin) {
++        if (fin.read(name.data(), static_cast<size_t>(name_len)) != static_cast<size_t>(name_len)) {
+             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: truncated tensor name", kTag);
+             return TRANSCRIBE_ERR_GGUF;
+         }
+@@ -352,11 +354,10 @@ transcribe_status parse_whisper_bin(const char * path, WhisperBinModel & out) {
+                     (long long) entry.ne[1], (long long) entry.ne[2], (long long) entry.ne[3]);
+             return TRANSCRIBE_ERR_GGUF;
+         }
+-        entry.offset = static_cast<uint64_t>(fin.tellg());
++        entry.offset = static_cast<uint64_t>(tell(fin));
+ 
+         // Skip the payload to land on the next tensor header.
+-        fin.seekg(static_cast<std::streamoff>(entry.nbytes), std::ios::cur);
+-        if (!fin) {
++        if (!fin.seek(static_cast<int64_t>(entry.offset + entry.nbytes))) {
+             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR,
+                     "%s: tensor \"%s\" payload runs past end of file "
+                     "(offset=%llu nbytes=%llu) — file is truncated",
+@@ -378,7 +379,7 @@ transcribe_status parse_whisper_bin(const char * path, WhisperBinModel & out) {
+ transcribe_status stream_tensor_data_from_bin(const std::string &                path,
+                                               const std::vector<BinStreamSlot> & slots,
+                                               const char *                       error_tag) {
+-    std::ifstream fin(path_from_utf8(path), std::ios::binary);
++    BinaryFile fin(path);
+     if (!fin) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: failed to reopen %s for tensor data", error_tag, path.c_str());
+         return TRANSCRIBE_ERR_GGUF;
+@@ -404,13 +405,11 @@ transcribe_status stream_tensor_data_from_bin(const std::string &
+         if (staging.size() < want) {
+             staging.resize(want);
+         }
+-        fin.seekg(static_cast<std::streamoff>(s.src_off));
+-        if (!fin) {
++        if (!fin.seek(static_cast<int64_t>(s.src_off))) {
+             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: seek failed for tensor \"%s\"", error_tag, s.dst->name);
+             return TRANSCRIBE_ERR_GGUF;
+         }
+-        fin.read(reinterpret_cast<char *>(staging.data()), static_cast<std::streamsize>(want));
+-        if (!fin || static_cast<size_t>(fin.gcount()) != want) {
++        if (fin.read(staging.data(), want) != want) {
+             log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "%s: short read for tensor \"%s\"", error_tag, s.dst->name);
+             return TRANSCRIBE_ERR_GGUF;
+         }

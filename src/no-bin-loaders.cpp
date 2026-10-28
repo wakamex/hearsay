@@ -1,8 +1,7 @@
 // transcribe.cpp's shared loader sends whisper.cpp-format .bin files to the
-// Whisper and Silero VAD families. hearsay never builds Whisper, so its entry
-// point reports that .bin files are not supported instead of pulling the family
-// into the build; Silero's is stood in for the same way unless -Dsilero builds
-// the family, whose own loader then reads them.
+// Whisper and Silero VAD families. Unless -Dwhisper or -Dsilero builds a
+// family, whose own loader then reads them, its entry point reports that .bin
+// files are not supported instead of pulling the family into the build.
 //
 // The per-stage tensor dumper in transcribe-debug.cpp is also stubbed out so
 // production builds do not pull in std::ofstream and std::locale formatting.
@@ -11,11 +10,13 @@
 #include "transcribe-debug.h"
 
 namespace transcribe {
+#ifndef HEARSAY_WHISPER
 namespace whisper {
 transcribe_status load_from_bin(const char *, const transcribe_model_load_params *, transcribe_model **) {
     return TRANSCRIBE_ERR_NOT_IMPLEMENTED;
 }
 }  // namespace whisper
+#endif
 
 #ifndef HEARSAY_SILERO
 namespace silero_vad {

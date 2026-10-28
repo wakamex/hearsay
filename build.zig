@@ -1,6 +1,6 @@
-// Builds hearsay (speech recognition on transcribe.cpp's Parakeet family and
-// speech synthesis on pockettts.cpp, sharing one ggml) as a static library,
-// and the hearsay-bench tool.
+// Builds hearsay (speech recognition on transcribe.cpp's Parakeet and Whisper
+// families and speech synthesis on pockettts.cpp and qwentts.cpp, sharing one
+// ggml) as a static library, and the hearsay-bench tool.
 //   zig build -Dhear=true -Dsay=true
 //   zig build -Dhear=true -Dsay=true -Dtarget=x86_64-windows-gnu
 //   zig build -Dhear=true -Dsay=true -Dtarget=aarch64-macos -Dmacos_sdk=PATH
@@ -8,6 +8,7 @@ const std = @import("std");
 
 const transcribe_commit = "90cd63d53b3103d137dcf463ec62338a66f56174";
 const pockettts_commit = "6187e69a6b3badbfcc677cb71a846f28ca560f54";
+const qwentts_commit = "5916bf7c79dbb4e66fc059cdc507a79a23a28bb4";
 
 fn useSdk(mod: *std.Build.Module, sdk: ?std.Build.LazyPath) void {
     const dir = sdk orelse return;
@@ -24,12 +25,15 @@ pub fn build(b: *std.Build) void {
     const say = b.option(bool, "say", "Include default speech synthesis (enables -Dpockettts=true)") orelse false;
     const parakeet = (b.option(bool, "parakeet", "Include Parakeet speech recognition (transcribe.cpp)") orelse false) or hear;
     const pockettts = (b.option(bool, "pockettts", "Include Pocket TTS speech synthesis (pockettts.cpp)") orelse false) or say;
+    const whisper = b.option(bool, "whisper", "Include Whisper speech recognition (transcribe.cpp)") orelse false;
+    const qwentts = b.option(bool, "qwentts", "Include Qwen3-TTS speech synthesis (qwentts.cpp)") orelse false;
     const silero = b.option(bool, "silero", "Include Silero voice activity detection (transcribe.cpp)") orelse false;
     const gpu = b.option(Gpu, "gpu", "Run on a GPU where one is usable, else on the CPU: vulkan (needs glslc to build)") orelse .none;
     const glslc = b.option([]const u8, "glslc", "The glslc shader compiler, for -Dgpu=vulkan (default: glslc on the PATH)") orelse "glslc";
 
-    if (!parakeet and !pockettts and !silero) {
-        b.getInstallStep().dependOn(&b.addFail("enable at least one capability or model family: -Dhear=true, -Dsay=true, -Dparakeet=true, -Dpockettts=true and/or -Dsilero=true").step);
+    const transcribe = parakeet or whisper or silero;
+    if (!transcribe and !pockettts and !qwentts) {
+        b.getInstallStep().dependOn(&b.addFail("enable at least one capability or model family: -Dhear=true, -Dsay=true, -Dparakeet=true, -Dwhisper=true, -Dpockettts=true, -Dqwentts=true and/or -Dsilero=true").step);
         return;
     }
 
@@ -90,6 +94,7 @@ pub fn build(b: *std.Build) void {
         "-DTRANSCRIBE_BUILD",
         "-DTRANSCRIBE_COMMIT=\"" ++ transcribe_commit ++ "\"",
         "-DPOCKET_STATIC",
+        "-DQWEN_STATIC",
     }) catch @panic("OOM");
     if (gpu == .vulkan) {
         common_flags.append(b.allocator, "-DGGML_USE_VULKAN") catch @panic("OOM");
@@ -185,7 +190,7 @@ pub fn build(b: *std.Build) void {
 
     const lib = b.addLibrary(.{ .name = "hearsay", .linkage = .static, .root_module = mod });
 
-    if (parakeet or silero) {
+    if (transcribe) {
         const patch_tr_arch = @embedFile("patches/transcribe/0001-register-only-built-families.patch");
         const patch_tr_io = @embedFile("patches/transcribe/0002-stdio-file-io.patch");
         const tr_arch_cpp = wf.add("transcribe-arch.cpp", patchFile(b, tr_dep, "", "src/transcribe-arch.cpp", &.{patch_tr_arch}));
@@ -199,6 +204,7 @@ pub fn build(b: *std.Build) void {
         var arch_flags: std.ArrayList([]const u8) = .empty;
         arch_flags.appendSlice(b.allocator, cxx_noexcept_list.items) catch @panic("OOM");
         if (parakeet) arch_flags.append(b.allocator, "-DHEARSAY_PARAKEET") catch @panic("OOM");
+        if (whisper) arch_flags.append(b.allocator, "-DHEARSAY_WHISPER") catch @panic("OOM");
         if (silero) arch_flags.append(b.allocator, "-DHEARSAY_SILERO") catch @panic("OOM");
         mod.addCSourceFile(.{ .file = tr_arch_cpp, .flags = arch_flags.items });
         mod.addCSourceFile(.{ .file = tr_loader_cpp, .flags = cxx_noexcept_list.items });
@@ -220,10 +226,11 @@ pub fn build(b: *std.Build) void {
             },
             .flags = cxx_noexcept_list.items,
         });
+        // Parakeet's and Whisper's encoders share transcribe.cpp's conformer helpers.
+        if (parakeet or whisper) mod.addCSourceFile(.{ .file = tr.path(b, "src/conformer/conformer.cpp"), .flags = cxx_noexcept_list.items });
         if (parakeet) mod.addCSourceFiles(.{
             .root = tr.path(b, "src"),
             .files = &.{
-                "conformer/conformer.cpp",
                 "arch/parakeet/model.cpp",
                 "arch/parakeet/longform.cpp",
                 "arch/parakeet/multitalker.cpp",
@@ -251,6 +258,30 @@ pub fn build(b: *std.Build) void {
             },
             .flags = cxx_flag_list.items,
         });
+        if (whisper) {
+            const patch_bin_io = @embedFile("patches/transcribe/0004-whisper-bin-stdio-file-io.patch");
+            const bin_loader_cpp = wf.add("transcribe-bin-loader.cpp", patchFile(b, tr_dep, "", "src/transcribe-bin-loader.cpp", &.{patch_bin_io}));
+            mod.addCSourceFile(.{ .file = bin_loader_cpp, .flags = cxx_noexcept_list.items });
+            // miniz compresses the decoded tokens for Whisper's compression-ratio check; its trimming
+            // flags are transcribe.cpp's, and reach miniz.c and its one user, model.cpp.
+            const miniz_flags: []const []const u8 = &.{ "-DMINIZ_NO_INFLATE_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES" };
+            const whisper_flags = std.mem.concat(b.allocator, []const u8, &.{ arch_flags.items, miniz_flags }) catch @panic("OOM");
+            mod.addCSourceFiles(.{
+                .root = tr.path(b, "src"),
+                .files = &.{
+                    "arch/whisper/model.cpp",
+                    "arch/whisper/capabilities.cpp",
+                    "arch/whisper/weights.cpp",
+                    "arch/whisper/encoder.cpp",
+                    "arch/whisper/decoder.cpp",
+                    "arch/whisper/bin_load.cpp",
+                    "arch/whisper/public.cpp",
+                },
+                .flags = whisper_flags,
+            });
+            mod.addCSourceFile(.{ .file = tr.path(b, "src/third_party/miniz/miniz.c"), .flags = std.mem.concat(b.allocator, []const u8, &.{ c_flag_list.items, miniz_flags }) catch @panic("OOM") });
+            lib.installHeader(tr.path(b, "include/transcribe/whisper.h"), "transcribe/whisper.h");
+        }
         if (silero) {
             const patch_silero_io = @embedFile("patches/transcribe/0003-silero-stdio-file-io.patch");
             const silero_model_cpp = wf.add("silero-vad-model.cpp", patchFile(b, tr_dep, "", "src/arch/silero_vad/model.cpp", &.{patch_silero_io}));
@@ -284,10 +315,29 @@ pub fn build(b: *std.Build) void {
         lib.installHeader(wf.add("include/pocket.h", staticHeader(b, pt_dep, "src/pocket.h", "POCKET_STATIC")), "pocket.h");
     }
 
+    if (qwentts) {
+        if (b.lazyDependency("qwentts", .{})) |qt_dep| {
+            const patch_qt_threads = @embedFile("patches/qwentts/0001-thread-count-from-QWEN_THREADS.patch");
+            // A copy of qwentts.cpp's sources with the patched backend.h, so that each of its files,
+            // which find their headers beside them, sees the patched one and none of pockettts.cpp's
+            // headers of the same names.
+            const qwf = b.addWriteFiles();
+            _ = qwf.addCopyDirectory(qt_dep.path("src"), "", .{ .exclude_extensions = &.{ "backend.h", "tts-server.h" } });
+            _ = qwf.add("backend.h", patchFile(b, qt_dep, "", "src/backend.h", &.{patch_qt_threads}));
+            _ = qwf.add("version.h", "#pragma once\n#define QWEN_VERSION \"" ++ qwentts_commit[0..7] ++ "\"\n");
+            mod.addCSourceFiles(.{
+                .root = qwf.getDirectory(),
+                .files = &.{ "qwen.cpp", "pipeline-tts.cpp", "pipeline-codec.cpp" },
+                .flags = cxx_flag_list.items,
+            });
+            lib.installHeader(wf.add("include/qwen.h", staticHeader(b, qt_dep, "src/qwen.h", "QWEN_STATIC")), "qwen.h");
+        }
+    }
+
     b.installArtifact(lib);
 
     // Benchmark and parity tool: zig-out/bin/hearsay-bench, for the recognition and synthesis families.
-    if (!parakeet and !pockettts) return;
+    if (!parakeet and !whisper and !pockettts and !qwentts) return;
     const bench_mod = b.createModule(.{
         .target = target,
         .optimize = if (optimize == .debug) .fast else optimize,
@@ -307,7 +357,9 @@ pub fn build(b: *std.Build) void {
         "-fno-asynchronous-unwind-tables",
     }) catch @panic("OOM");
     if (parakeet) bench_flags.append(b.allocator, "-DHEARSAY_PARAKEET") catch @panic("OOM");
+    if (whisper) bench_flags.append(b.allocator, "-DHEARSAY_WHISPER") catch @panic("OOM");
     if (pockettts) bench_flags.append(b.allocator, "-DHEARSAY_POCKETTTS") catch @panic("OOM");
+    if (qwentts) bench_flags.append(b.allocator, "-DHEARSAY_QWENTTS") catch @panic("OOM");
     bench_mod.addCSourceFile(.{
         .file = b.path("tools/hearsay-bench.c"),
         .flags = bench_flags.items,

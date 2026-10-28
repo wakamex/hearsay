@@ -1,9 +1,10 @@
 // hearsay-bench: times speech recognition and speech synthesis through the
 // hearsay build and writes JSON, so its output and speed can be compared with
-// the separate transcribe.cpp and pockettts.cpp builds.
+// the separate transcribe.cpp, pockettts.cpp and qwentts.cpp builds.
 //
 //   hearsay-bench hear MODEL THREADS LIST
-//       Transcribes each 16 kHz mono WAV named in LIST (one path per line).
+//       Transcribes each 16 kHz mono WAV named in LIST (one path per line) in
+//       English, with a Parakeet or Whisper model.
 //       Prints one JSON object per line: a header with the load time, then
 //       {"file", "text", "total_ms"} per file.
 //   hearsay-bench say MODEL VOICES VOICE THREADS TEXTS OUT_PREFIX
@@ -12,20 +13,26 @@
 //       warm up, and writes the second pass as OUT_PREFIX-<i>.pcm (s16le,
 //       24 kHz). Prints one JSON object with the time to first audio, total
 //       time and audio length per line.
+//   hearsay-bench qwen TALKER CODEC VOICE THREADS TEXTS OUT_PREFIX
+//       The same for Qwen3-TTS in English. VOICE is a speaker name for a
+//       custom-voice model, a description of the voice for a voice-design
+//       model, or for a base model a 24 kHz mono WAV to clone, with its
+//       transcript beside it in a .txt file of the same name.
 //
 // Both run on the best device the build has (the GPU in a -Dgpu=vulkan build
 // where one is usable); GGML_DISABLE_VULKAN=1 keeps them to the CPU.
 
-#if !defined(HEARSAY_PARAKEET) && !defined(HEARSAY_POCKETTTS)
-#define HEARSAY_PARAKEET  1
-#define HEARSAY_POCKETTTS 1
+#if defined(HEARSAY_PARAKEET) || defined(HEARSAY_WHISPER)
+#define HEARSAY_HEAR 1
+#include "transcribe.h"
 #endif
-
 #ifdef HEARSAY_POCKETTTS
 #include "pocket.h"
 #endif
-#ifdef HEARSAY_PARAKEET
-#include "transcribe.h"
+#ifdef HEARSAY_QWENTTS
+#include "qwen.h"
+#endif
+#if defined(HEARSAY_HEAR) || defined(HEARSAY_QWENTTS)
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #endif
@@ -59,7 +66,7 @@ static double peak_rss_mb(void) {
 #endif
 }
 
-#ifdef HEARSAY_PARAKEET
+#ifdef HEARSAY_HEAR
 static void json_string(const char * s) {
     putchar('"');
     for (; *s; s++) {
@@ -132,12 +139,12 @@ static int hear(const char * model, int threads, const char * list) {
 }
 #endif
 
-#ifdef HEARSAY_POCKETTTS
-static void set_threads_env(const char * threads) {
+#if defined(HEARSAY_POCKETTTS) || defined(HEARSAY_QWENTTS)
+static void set_env(const char * name, const char * value) {
 #ifdef _WIN32
-    _putenv_s("POCKET_THREADS", threads);
+    _putenv_s(name, value);
 #else
-    setenv("POCKET_THREADS", threads, 1);
+    setenv(name, value, 1);
 #endif
 }
 
@@ -164,10 +171,12 @@ static bool on_chunk(const float * s, int n, void * user) {
     }
     return true;
 }
+#endif
 
+#ifdef HEARSAY_POCKETTTS
 static int say(const char * model, const char * voices, const char * voice_name, const char * threads,
                const char * texts, const char * out_prefix) {
-    set_threads_env(threads);
+    set_env("POCKET_THREADS", threads);
     double                 t = now();
     struct pt_init_params ip;
     pt_init_default_params(&ip);
@@ -227,8 +236,114 @@ static int say(const char * model, const char * voices, const char * voice_name,
 }
 #endif
 
+#ifdef HEARSAY_QWENTTS
+// Reads a whole text file, without its trailing newline, or returns NULL.
+static char * read_text(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    fseek(f, 0, SEEK_END);
+    long   n = ftell(f);
+    char * s = malloc((size_t) n + 1);
+    fseek(f, 0, SEEK_SET);
+    n = (long) fread(s, 1, (size_t) n, f);
+    fclose(f);
+    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) {
+        n--;
+    }
+    s[n] = 0;
+    return s;
+}
+
+static int qwen(const char * talker, const char * codec, const char * voice, const char * threads,
+                const char * texts, const char * out_prefix) {
+    set_env("QWEN_THREADS", threads);
+    double                t = now();
+    struct qt_init_params ip;
+    qt_init_default_params(&ip);
+    ip.talker_path          = talker;
+    ip.codec_path           = codec;
+    struct qt_context * ctx = qt_init(&ip);
+    if (!ctx) {
+        fprintf(stderr, "qt_init: %s\n", qt_last_error());
+        return 1;
+    }
+    const char * type      = qt_model_type(ctx);
+    float *      ref       = NULL;
+    drwav_uint64 ref_n     = 0;
+    char *       ref_text  = NULL;
+    if (!strcmp(type, "base")) {
+        unsigned int channels = 0, rate = 0;
+        ref = drwav_open_file_and_read_pcm_frames_f32(voice, &channels, &rate, &ref_n, NULL);
+        if (!ref || channels != 1 || rate != 24000) {
+            fprintf(stderr, "%s: a base model needs a 24 kHz mono WAV to clone\n", voice);
+            return 1;
+        }
+        char   path[4096];
+        size_t len = strlen(voice);
+        snprintf(path, sizeof path, "%.*s.txt", (int) (len > 4 ? len - 4 : len), voice);
+        if (!(ref_text = read_text(path))) {
+            fprintf(stderr, "cannot open %s, the transcript of %s\n", path, voice);
+            return 1;
+        }
+    }
+    printf("{\"load\": %.3f, \"type\": \"%s\", \"rows\": [", now() - t, type);
+    char line[8192];
+    int  first_row = 1;
+    for (int pass = 0; pass < 2; pass++) {
+        FILE * f = fopen(texts, "r");
+        if (!f) {
+            fprintf(stderr, "cannot open %s\n", texts);
+            return 1;
+        }
+        for (int i = 0; fgets(line, sizeof line, f); i++) {
+            line[strcspn(line, "\r\n")] = 0;
+            struct qt_tts_params p;
+            qt_tts_default_params(&p);
+            p.text = line;
+            p.lang = "english";
+            p.seed = 42;
+            if (!strcmp(type, "custom_voice")) {
+                p.speaker = voice;
+            } else if (!strcmp(type, "voice_design")) {
+                p.instruct = voice;
+            } else {
+                p.ref_audio_24k = ref;
+                p.ref_n_samples = (int) ref_n;
+                p.ref_text      = ref_text;
+            }
+            p.on_chunk = on_chunk;
+            char path[4096];
+            snprintf(path, sizeof path, "%s-%d.pcm", out_prefix, i);
+            chunk_state x        = { now(), -1, 0, 0, pass ? fopen(path, "wb") : NULL };
+            p.on_chunk_user_data = &x;
+            struct qt_audio out  = { 0 };
+            if (qt_synthesize(ctx, &p, &out)) {
+                fprintf(stderr, "qt_synthesize: %s\n", qt_last_error());
+                return 1;
+            }
+            double total = now() - x.t0;
+            if (x.pcm) {
+                fclose(x.pcm);
+            }
+            printf("%s{\"pass\": %d, \"i\": %d, \"ttfa\": %.4f, \"total\": %.4f, \"audio\": %.3f, \"chunks\": %d}",
+                   first_row ? "" : ", ", pass, i, x.first, total, (double) x.n / 24000, x.chunks);
+            first_row = 0;
+            qt_audio_free(&out);
+        }
+        fclose(f);
+    }
+    printf("], \"rss_mb\": %.1f}\n", peak_rss_mb());
+    drwav_free(ref, NULL);
+    free(ref_text);
+    qt_free(ctx);
+    return 0;
+}
+#endif
+
 int main(int argc, char ** argv) {
-#ifdef HEARSAY_PARAKEET
+#ifdef HEARSAY_HEAR
     if (argc == 5 && strcmp(argv[1], "hear") == 0) {
         return hear(argv[2], atoi(argv[3]), argv[4]);
     }
@@ -238,10 +353,16 @@ int main(int argc, char ** argv) {
         return say(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
     }
 #endif
+#ifdef HEARSAY_QWENTTS
+    if (argc == 8 && strcmp(argv[1], "qwen") == 0) {
+        return qwen(argv[2], argv[3], argv[4], argv[5], argv[6], argv[7]);
+    }
+#endif
     bool help = argc == 2 && (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0);
     fprintf(help ? stdout : stderr,
             "usage: %s hear MODEL THREADS LIST\n"
-            "       %s say MODEL VOICES VOICE THREADS TEXTS OUT_PREFIX\n",
-            argv[0], argv[0]);
+            "       %s say MODEL VOICES VOICE THREADS TEXTS OUT_PREFIX\n"
+            "       %s qwen TALKER CODEC VOICE THREADS TEXTS OUT_PREFIX\n",
+            argv[0], argv[0], argv[0]);
     return help ? 0 : 2;
 }

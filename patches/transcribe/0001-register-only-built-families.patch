@@ -1,6 +1,6 @@
 --- a/src/transcribe-arch.cpp
 +++ b/src/transcribe-arch.cpp
-@@ -104,11 +104,13 @@
+@@ -104,11 +104,16 @@
      }
  
      static const Arch * const k_archs[] = {
@@ -11,6 +11,9 @@
 +// hearsay builds only the families it is asked for (build.zig defines these)
 +#ifdef HEARSAY_PARAKEET
 +        &parakeet::arch,
++#endif
++#ifdef HEARSAY_WHISPER
++        &whisper::arch,
 +#endif
 +#ifdef HEARSAY_SILERO
          &silero_vad::arch,

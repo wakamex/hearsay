@@ -1,11 +1,11 @@
 # hearsay
 
-hearsay is the local speech engine for gear, a voice front-end for coding agents: it hears, turning speech into text, and says, turning text into speech, in one small native build, on the CPU or, optionally, on the GPU through [Vulkan](https://www.vulkan.org/). It compiles only the parts of two upstream projects that gear uses against a single copy of the [ggml](https://github.com/ggml-org/ggml) tensor library:
+hearsay is the local speech engine for gear, a voice front-end for coding agents: it hears, turning speech into text, and says, turning text into speech, in one small native build, on the CPU or, optionally, on the GPU through [Vulkan](https://www.vulkan.org/). It compiles only the parts of three upstream projects that its callers ask for against a single copy of the [ggml](https://github.com/ggml-org/ggml) tensor library:
 
-- Hearing: NVIDIA's Parakeet models, such as [Parakeet TDT-CTC 110M](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m), through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), with only its Parakeet family built, and optionally [Silero VAD](https://github.com/snakers4/silero-vad) from the same library, for telling speech from other sound.
-- Saying: Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) through [pockettts.cpp](https://github.com/ServeurpersoCom/pockettts.cpp), which streams audio as it is generated, without its command-line tool and HTTP server.
+- Hearing: NVIDIA's Parakeet models, such as [Parakeet TDT-CTC 110M](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m), through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), with only its Parakeet family built, and optionally OpenAI's [Whisper](https://github.com/openai/whisper) models from the same library, from GGUF or whisper.cpp `.bin` files, and [Silero VAD](https://github.com/snakers4/silero-vad), for telling speech from other sound.
+- Saying: Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) through [pockettts.cpp](https://github.com/ServeurpersoCom/pockettts.cpp), which streams audio as it is generated, without its command-line tool and HTTP server, and optionally Alibaba's [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (base models that clone a voice from a recording, custom-voice models with named speakers, and voice-design models that take a description of the voice) through [qwentts.cpp](https://github.com/ServeurpersoCom/qwentts.cpp), by the same author.
 
-Both projects are fetched at pinned commits and changed only by the patch files in `patches/`. The GPU build also fetches the Khronos [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) and [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) at pinned releases.
+The projects are fetched at pinned commits and changed only by the patch files in `patches/`. The GPU build also fetches the Khronos [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) and [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) at pinned releases.
 
 ## Result
 
@@ -35,16 +35,20 @@ Parity checks:
 
 | Patch | Why |
 | --- | --- |
-| `patches/transcribe/0001-register-only-built-families.patch` | transcribe.cpp lists all 21 model families in one table, which would link every family. hearsay's copy lists only the families the build includes, Parakeet and Silero VAD. |
+| `patches/transcribe/0001-register-only-built-families.patch` | transcribe.cpp lists all 21 model families in one table, which would link every family. hearsay's copy lists only the families the build includes: Parakeet, Whisper and Silero VAD. |
 | `patches/transcribe/0002-stdio-file-io.patch` | Replaces `std::ifstream` and `std::filesystem::status` in model loading with `ggml_fopen`, 64-bit `fseeko` / `_fseeki64` and `stat` / `GetFileAttributesW`, avoiding `std::locale` and `std::filesystem` in the linked binary while preserving UTF-8 path support on Windows. |
 | `patches/transcribe/0003-silero-stdio-file-io.patch` | The same change as 0002 for Silero VAD's reader of whisper.cpp-format `.bin` files, which used `std::ifstream` and the `path_from_utf8` that 0002 removes. |
+| `patches/transcribe/0004-whisper-bin-stdio-file-io.patch` | The same change as 0002 for the reader of whisper.cpp-format `.bin` files that Whisper uses, `transcribe-bin-loader.cpp`. |
 | `patches/ggml/0001` to `0003` | The three commits pockettts.cpp's ggml fork ([ServeurpersoCom/ggml](https://github.com/ServeurpersoCom/ggml)) adds to upstream ggml, by Pascal and copied unchanged (see [License](#license)): a fused snake activation on the CPU and two `conv_1d` fixes for batched input. Both forks start from the same upstream ggml (`d7cb574` and its successor `ffa4e8b`, which changes only a release script), so these apply on top of transcribe.cpp's patched ggml. |
 | `patches/pockettts/0001-thread-count-from-POCKET_THREADS.patch` | Reads `POCKET_THREADS` for the CPU thread count instead of always using one thread per physical core, and skips `ggml_backend_load_all()` when `POCKET_STATIC` is defined so static builds do not scan the working directory for dynamic backend plugins. |
+| `patches/qwentts/0001-thread-count-from-QWEN_THREADS.patch` | The same change as `patches/pockettts/0001` for qwentts.cpp, with `QWEN_THREADS` and `QWEN_STATIC`. |
 | `patches/pockettts/0002-comma-before-every-chunk.patch` | Puts ", " before the text of every chunk. pockettts.cpp drops the audio of each chunk's first frame (80 ms), which decodes to a click, and when the voice starts at once a short first word goes with it: on 480 sentences opening with "I" (30 sentences, 16 seeds), the "I" was lost from 4.4% at the start of a text and 8.1% at the start of a later chunk, and from none of either with the comma, which adds about 0.08 s of quiet before each chunk's speech. A comma added to the text by the caller does not do this: Pocket can cut a long first sentence at it and voice it as a chunk of its own. |
 
-`src/no-bin-loaders.cpp` stands in for the functions transcribe.cpp's shared loader calls for whisper.cpp-format `.bin` files and for the development tensor dumper in `transcribe-debug.cpp`. Whisper's `.bin` loader returns `TRANSCRIBE_ERR_NOT_IMPLEMENTED`, and so does Silero VAD's unless `-Dsilero` builds that family, whose own loader then reads them; `transcribe-bin-loader.cpp` and `transcribe-debug.cpp` are omitted. Parakeet's model code links the Sortformer diarizer for its multi-speaker variant, so that family is compiled as is.
+`src/no-bin-loaders.cpp` stands in for the functions transcribe.cpp's shared loader calls for whisper.cpp-format `.bin` files and for the development tensor dumper in `transcribe-debug.cpp`. Whisper's and Silero VAD's `.bin` loaders return `TRANSCRIBE_ERR_NOT_IMPLEMENTED` unless `-Dwhisper` or `-Dsilero` builds that family, whose own loader then reads them; `transcribe-debug.cpp` is omitted, and so is `transcribe-bin-loader.cpp` without Whisper. Parakeet's model code links the Sortformer diarizer for its multi-speaker variant, so that family is compiled as is.
 
 `src/vulkan-loader.cpp`, in GPU builds only, opens the Vulkan loader (`vulkan-1.dll` or `libvulkan.so.1`) when the program starts instead of linking it, and supplies the four Vulkan functions ggml calls directly by forwarding them to the loader's. Without a loader it sets `GGML_DISABLE_VULKAN`, so ggml registers only the CPU and the program runs there.
+
+qwentts.cpp pins its author's ggml fork at [cc5df49](https://github.com/ServeurpersoCom/ggml/commit/cc5df49a6b878db2b68b9a7b45976e279594627d), upstream ggml 0.27.0 with the fused snake activation (`patches/ggml/0001`) and a SYCL fix. It calls nothing that ggml 0.26.0 lacks: the public headers gained only two scheduler callbacks between them, which it does not use. So it builds on hearsay's ggml unchanged. Its sources are copied into the build cache with the patched `backend.h`, because they find their headers beside them and several share names with pockettts.cpp's (`backend.h`, `debug.h`, `weight-ctx.h`).
 
 Build settings: ggml is built with transcribe.cpp's settings, without BLAS or OpenMP and with [llamafile](https://github.com/Mozilla-Ocho/llamafile)'s matrix kernels, which make both engines faster on this CPU. `GGML_MAX_NAME` is 128 for every target, as pockettts.cpp needs; it changes the layout of ggml's tensor struct, so it must match everywhere.
 
@@ -57,7 +61,7 @@ hearsay is scoped to speech (`hear` for speech recognition and `say` for speech 
 
 ## Build
 
-Callers can opt in by capability (`-Dhear=true` for default Parakeet speech recognition, `-Dsay=true` for default Pocket TTS speech synthesis) or by individual model family (`-Dparakeet=true`, `-Dpockettts=true`, `-Dsilero=true` for Silero VAD), compiling and linking only the directions or model families they use. With Silero, `transcribe/vad.h` is installed beside `transcribe.h`.
+Callers can opt in by capability (`-Dhear=true` for default Parakeet speech recognition, `-Dsay=true` for default Pocket TTS speech synthesis) or by individual model family (`-Dparakeet=true`, `-Dwhisper=true`, `-Dpockettts=true`, `-Dqwentts=true`, `-Dsilero=true` for Silero VAD), compiling and linking only the directions or model families they use. Whisper adds `transcribe/whisper.h` beside `transcribe.h`, Silero `transcribe/vad.h`, and Qwen3-TTS `qwen.h` (with `QWEN_STATIC` defined). qwentts.cpp is a lazy dependency, fetched only by builds that ask for it.
 
 With Zig 0.17.0:
 
@@ -97,11 +101,14 @@ cmake --build build -j
 ```sh
 zig-out/bin/hearsay-bench hear parakeet-tdt_ctc-110m-Q4_K_M.gguf 1 wavs.txt
 zig-out/bin/hearsay-bench say pocket-tts-english_2026-09-Q8_0.gguf pocket-tts-english_2026-09-voices.gguf alba 1 texts.txt out/say
+zig-out/bin/hearsay-bench qwen qwen-talker-1.7b-base-Q8_0.gguf qwen-tokenizer-12hz-Q8_0.gguf voice.wav 8 texts.txt out/qwen
 ```
+
+`hear` takes Parakeet and Whisper models. For `qwen`, the voice is a speaker name for a custom-voice model, a description of the voice for a voice-design model, or for a base model a 24 kHz mono WAV to clone, with its transcript in a `.txt` file of the same name beside it (`voice.txt`).
 
 Both run on the best device the build has, and print the recognition backend in their first line; `GGML_DISABLE_VULKAN=1` keeps them on the CPU. The voices argument can also be one voice's `.safetensors` file.
 
-The models are [parakeet-tdt_ctc-110m-Q4_K_M.gguf](https://huggingface.co/handy-computer/parakeet-tdt_ctc-110m-gguf) and the [Pocket TTS GGUFs](https://huggingface.co/Serveurperso/pocket-tts-GGUF).
+The models are [parakeet-tdt_ctc-110m-Q4_K_M.gguf](https://huggingface.co/handy-computer/parakeet-tdt_ctc-110m-gguf), the [Pocket TTS GGUFs](https://huggingface.co/Serveurperso/pocket-tts-GGUF), the [Whisper GGUFs](https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf) converted for transcribe.cpp or [whisper.cpp's `.bin` files](https://huggingface.co/ggerganov/whisper.cpp), and the [Qwen3-TTS GGUFs](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF), a talker and the 12 Hz tokenizer.
 
 ### GPU
 
@@ -115,20 +122,20 @@ The compiled shaders make `hearsay-bench` 46 MB instead of 2.3 MB. On an RTX 308
 
 ## Limitations
 
-- Only the model families named above are built: Parakeet for recognition, Pocket TTS for synthesis and Silero for speech detection. Other transcribe.cpp families, and whisper.cpp-format `.bin` models other than Silero's, are not.
-- The GPU build supports Vulkan only, and needs glslc to build. The CMake build is CPU only and has no Silero option.
+- Only the model families named above are built: Parakeet and Whisper for recognition, Pocket TTS and Qwen3-TTS for synthesis and Silero for speech detection. Other transcribe.cpp families are not.
+- The GPU build supports Vulkan only, and needs glslc to build. The CMake build is CPU only and has only Parakeet and Pocket TTS.
 - Speed and parity were measured on one machine, a Ryzen 7 3800XT, plus an RTX 3080 for the GPU figures.
 
 ## Development checks
 
-`tests/smoke.sh` builds hearsay, downloads the Parakeet TDT-CTC 110M and Pocket TTS models into `.models` (or `$HEARSAY_MODELS`) at pinned commits, checks their SHA-256, and checks that Parakeet transcribes `tests/utterance.wav` and that Pocket speaks a sentence. Extra arguments go to `zig build`, such as `tests/smoke.sh -Dgpu=vulkan`. CI runs it on Linux, Windows and macOS, the Vulkan build on Linux (where, without a GPU, it falls back to the CPU), a cross-build for Windows from Linux, and the CMake build.
+`tests/smoke.sh` builds hearsay with every model family, downloads Parakeet TDT-CTC 110M, Whisper tiny.en (as a GGUF and as a whisper.cpp `.bin`), Pocket TTS and Qwen3-TTS 0.6B custom-voice Q4_K_M into `.models` (or `$HEARSAY_MODELS`) at pinned commits, checks their SHA-256, and checks that Parakeet and both Whisper files transcribe `tests/utterance.wav` and that Pocket and Qwen3-TTS speak a sentence. Extra arguments go to `zig build`, such as `tests/smoke.sh -Dgpu=vulkan`. CI runs it on Linux, Windows and macOS, the Vulkan build on Linux (where, without a GPU, it falls back to the CPU), a cross-build for Windows from Linux, and the CMake build.
 
 ## License
 
-hearsay's own files, and the patches in `patches/transcribe/` and `patches/pockettts/`, are under the MIT license in [LICENSE](LICENSE). The patches change files of transcribe.cpp, pockettts.cpp and ggml, which stay under their own MIT licenses; each patch folder holds the license of the project it patches (`patches/*/LICENSE`).
+hearsay's own files, and the patches in `patches/transcribe/`, `patches/pockettts/` and `patches/qwentts/`, are under the MIT license in [LICENSE](LICENSE). The patches change files of transcribe.cpp, pockettts.cpp, qwentts.cpp and ggml, which stay under their own MIT licenses; each patch folder holds the license of the project it patches (`patches/*/LICENSE`).
 
 `patches/ggml/0001` to `0003` are not hearsay's: Pascal (ServeurpersoCom), the author of pockettts.cpp, wrote them as commits [feece7e](https://github.com/ServeurpersoCom/ggml/commit/feece7e1581f752e204048af99a765a70d19bd50), [2eddaf9](https://github.com/ServeurpersoCom/ggml/commit/2eddaf94a8cdbbf1c30017d28313cd661a9da543) and [2be5947](https://github.com/ServeurpersoCom/ggml/commit/2be5947ac234d277714e824a5c7eb23880557543) in his ggml fork, [ServeurpersoCom/ggml](https://github.com/ServeurpersoCom/ggml). They are copied unchanged and are under ggml's MIT license.
 
 `tests/utterance.wav` is utterance 1089-134686-0010 of LibriSpeech test-clean, by Vassil Panayotov, Guoguo Chen, Daniel Povey and Sanjeev Khudanpur ([LibriSpeech](https://www.openslr.org/12), 2015), under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). It was converted from FLAC to a 16-bit WAV at its original 16 kHz, without trimming.
 
-The models are not part of hearsay. The Parakeet and Pocket TTS weights are CC-BY-4.0, and Kyutai's terms for Pocket TTS prohibit cloning a voice without consent and deceptive use; Silero VAD's are MIT.
+The models are not part of hearsay. The Parakeet and Pocket TTS weights are CC-BY-4.0, and Kyutai's terms for Pocket TTS prohibit cloning a voice without consent and deceptive use; Silero VAD's and Whisper's are MIT, and Qwen3-TTS's Apache-2.0.
