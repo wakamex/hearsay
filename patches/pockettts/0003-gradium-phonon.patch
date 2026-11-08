@@ -878,7 +878,7 @@ index 78daf42..f7e4b21 100644
      if (L.ls2) {
          h = ggml_mul(ctx, h, L.ls2);
 diff --git a/src/voice.h b/src/voice.h
-index 7861ab8..1f48137 100644
+index 7861ab8..c0aa5ea 100644
 --- a/src/voice.h
 +++ b/src/voice.h
 @@ -10,6 +10,9 @@
@@ -891,7 +891,7 @@ index 7861ab8..1f48137 100644
  
  #include "gguf-weights.h"
  #include "pt-error.h"
-@@ -135,6 +138,50 @@ static bool voice_load_safetensors(PTVoice * vo, const char * path, int n_layers
+@@ -135,6 +138,51 @@ static bool voice_load_safetensors(PTVoice * vo, const char * path, int n_layers
      return voice_parse_safetensors(vo, data, path, n_layers, dim);
  }
  
@@ -917,13 +917,14 @@ index 7861ab8..1f48137 100644
 +    yyjson_val * shape = yyjson_obj_get(t, "shape");
 +    yyjson_val * off   = yyjson_obj_get(t, "data_offsets");
 +    const char * dt    = yyjson_get_str(yyjson_obj_get(t, "dtype"));
++    const bool   f32   = dt && strcmp(dt, "F32") == 0;  // read before the header is freed
 +    const size_t nd    = yyjson_arr_size(shape);
 +    const int64_t C    = nd >= 2 ? yyjson_get_int(yyjson_arr_get(shape, nd - 2)) : 0;
 +    const int64_t n    = nd >= 2 ? yyjson_get_int(yyjson_arr_get(shape, nd - 1)) : 0;
 +    const uint64_t a   = yyjson_get_uint(yyjson_arr_get(off, 0));
 +    const uint64_t b   = yyjson_get_uint(yyjson_arr_get(off, 1));
 +    yyjson_doc_free(doc);
-+    if (!t || !dt || strcmp(dt, "F32") != 0 || (nd != 2 && nd != 3) || C != channels || n <= 0 ||
++    if (!f32 || (nd != 2 && nd != 3) || C != channels || n <= 0 ||
 +        b - a != (uint64_t) (C * n * 4) || 8 + hn + b > data.size()) {
 +        pt_set_error("voice: %s holds no speaker_wavs F32 [1, %d, T] latents", path, channels);
 +        return false;
