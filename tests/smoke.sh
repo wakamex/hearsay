@@ -50,29 +50,31 @@ zig build -Doptimize=ReleaseFast -Dhear=true -Dsay=true -Dwhisper=true -Dqwentts
 bench=zig-out/bin/hearsay-bench
 [ -x "$bench" ] || bench=zig-out/bin/hearsay-bench.exe
 "$bench" --help > /dev/null
+# Runs hearsay-bench, keeping its log out of the output unless it fails.
+run() { "$bench" "$@" 2> "$out/log" || { echo "error: hearsay-bench $1 failed:" >&2; tail -n 20 "$out/log" >&2; exit 1; }; }
 
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 echo tests/utterance.wav > "$out/wavs.txt"
 for model in parakeet-tdt_ctc-110m-Q4_K_M.gguf whisper-tiny.en-Q8_0.gguf ggml-tiny.en-q8_0.bin; do
-    heard=$("$bench" hear "$models/$model" 2 "$out/wavs.txt" 2> /dev/null | tail -n 1)
+    heard=$(run hear "$models/$model" 2 "$out/wavs.txt" | tail -n 1)
     echo "heard ($model): $heard"
     case "$heard" in *declare*stick*) ;; *) echo "error: $model's transcript is not the recording's" >&2; exit 1 ;; esac
 done
 
 echo "I found the bug in the parser." > "$out/texts.txt"
-said=$("$bench" say "$models/pocket-tts-english_2026-09-Q8_0.gguf" "$models/alba.safetensors" alba 2 "$out/texts.txt" "$out/say" 2> /dev/null)
+said=$(run say "$models/pocket-tts-english_2026-09-Q8_0.gguf" "$models/alba.safetensors" alba 2 "$out/texts.txt" "$out/say")
 echo "said: $said"
 bytes=$(wc -c < "$out/say-0.pcm")
 # A second of 24 kHz 16-bit audio is 48,000 bytes; the sentence takes about two.
 [ "$bytes" -gt 48000 ] || { echo "error: Pocket made only $bytes bytes of audio" >&2; exit 1; }
 
-said=$("$bench" say "$models/phonon-31m-en/model.q8.gguf" "$models/phonon-31m-en/delia.safetensors" delia 2 "$out/texts.txt" "$out/phonon" 2> /dev/null)
+said=$(run say "$models/phonon-31m-en/model.q8.gguf" "$models/phonon-31m-en/delia.safetensors" delia 2 "$out/texts.txt" "$out/phonon")
 echo "said (Phonon): $said"
 bytes=$(wc -c < "$out/phonon-0.pcm")
 [ "$bytes" -gt 48000 ] || { echo "error: Phonon made only $bytes bytes of audio" >&2; exit 1; }
 
-said=$("$bench" qwen "$models/qwen-talker-0.6b-customvoice-Q4_K_M.gguf" "$models/qwen-tokenizer-12hz-Q4_K_M.gguf" ryan 2 "$out/texts.txt" "$out/qwen" 2> /dev/null)
+said=$(run qwen "$models/qwen-talker-0.6b-customvoice-Q4_K_M.gguf" "$models/qwen-tokenizer-12hz-Q4_K_M.gguf" ryan 2 "$out/texts.txt" "$out/qwen")
 echo "said (Qwen3-TTS): $said"
 bytes=$(wc -c < "$out/qwen-0.pcm")
 [ "$bytes" -gt 48000 ] || { echo "error: Qwen3-TTS made only $bytes bytes of audio" >&2; exit 1; }
