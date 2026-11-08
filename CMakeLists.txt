@@ -58,6 +58,7 @@ if(HEARSAY_POCKETTTS)
         PATCH_COMMAND  git checkout -- .
               COMMAND  git apply ${CMAKE_SOURCE_DIR}/patches/pockettts/0001-thread-count-from-POCKET_THREADS.patch
                                  ${CMAKE_SOURCE_DIR}/patches/pockettts/0002-comma-before-every-chunk.patch
+                                 ${CMAKE_SOURCE_DIR}/patches/pockettts/0003-gradium-phonon.patch
         UPDATE_DISCONNECTED TRUE)
     FetchContent_MakeAvailable(pockettts)
     set(PT ${pockettts_SOURCE_DIR})

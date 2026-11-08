@@ -302,17 +302,23 @@ pub fn build(b: *std.Build) void {
         const pt = pt_dep.path("");
         const patch_pt_threads = @embedFile("patches/pockettts/0001-thread-count-from-POCKET_THREADS.patch");
         const patch_pt_comma = @embedFile("patches/pockettts/0002-comma-before-every-chunk.patch");
+        const patch_pt_phonon = @embedFile("patches/pockettts/0003-gradium-phonon.patch");
 
-        _ = wf.add("pocket/version.h", "#pragma once\n#define POCKET_VERSION \"" ++ pockettts_commit ++ "\"\n");
-        _ = wf.add("pocket/backend.h", patchFile(b, pt_dep, "", "src/backend.h", &.{patch_pt_threads}));
-        const pocket_cpp = wf.add("pocket/pocket.cpp", patchFile(b, pt_dep, "", "src/pocket.cpp", &.{patch_pt_comma}));
+        // A copy of pockettts.cpp's sources with the patched files in place, since its headers
+        // include each other from beside them.
+        const pwf = b.addWriteFiles();
+        const patched = [_][]const u8{ "model.h", "flow-lm.h", "transformer.h", "tokenizer.h", "voice.h", "pocket.h" };
+        _ = pwf.addCopyDirectory(pt.path(b, "src"), "", .{ .exclude_extensions = &(patched ++ [_][]const u8{ "backend.h", "pocket.cpp", "tts-server.h" }) });
+        for (patched) |name| _ = pwf.add(name, patchFile(b, pt_dep, "", b.fmt("src/{s}", .{name}), &.{patch_pt_phonon}));
+        _ = pwf.add("backend.h", patchFile(b, pt_dep, "", "src/backend.h", &.{patch_pt_threads}));
+        _ = pwf.add("version.h", "#pragma once\n#define POCKET_VERSION \"" ++ pockettts_commit ++ "\"\n");
+        const pocket_cpp = pwf.add("pocket.cpp", patchFile(b, pt_dep, "", "src/pocket.cpp", &.{ patch_pt_comma, patch_pt_phonon }));
+        const pocket_h = patchFile(b, pt_dep, "", "src/pocket.h", &.{patch_pt_phonon});
 
-        mod.addIncludePath(wf.getDirectory().path(b, "pocket"));
-        mod.addIncludePath(pt.path(b, "src"));
         mod.addIncludePath(pt.path(b, "vendor/yyjson"));
         mod.addCSourceFile(.{ .file = pocket_cpp, .flags = cxx_flag_list.items });
         mod.addCSourceFile(.{ .file = pt.path(b, "vendor/yyjson/yyjson.c"), .flags = c_flag_list.items });
-        lib.installHeader(wf.add("include/pocket.h", staticHeader(b, pt_dep, "src/pocket.h", "POCKET_STATIC")), "pocket.h");
+        lib.installHeader(wf.add("include/pocket.h", b.fmt("#ifndef POCKET_STATIC\n#define POCKET_STATIC 1\n#endif\n{s}", .{pocket_h})), "pocket.h");
     }
 
     if (qwentts) {

@@ -12,7 +12,10 @@
 //       Synthesizes each line of TEXTS twice with seed 42, the first pass to
 //       warm up, and writes the second pass as OUT_PREFIX-<i>.pcm (s16le,
 //       24 kHz). Prints one JSON object with the time to first audio, total
-//       time and audio length per line.
+//       time, CPU time (wall time on Windows, whose clock() counts that) and
+//       audio length per line. MODEL can also be a Phonon model.q8.gguf, with
+//       its config.json and tokenizer.model beside it, and VOICES then a voice
+//       file of gradium/phonon-voices (VOICE is not used).
 //   hearsay-bench qwen TALKER CODEC VOICE THREADS TEXTS OUT_PREFIX
 //       The same for Qwen3-TTS in English. VOICE is a speaker name for a
 //       custom-voice model, a description of the voice for a voice-design
@@ -213,7 +216,8 @@ static int say(const char * model, const char * voices, const char * voice_name,
             p.seed     = 42;
             char path[4096];
             snprintf(path, sizeof path, "%s-%d.pcm", out_prefix, i);
-            chunk_state x = { now(), -1, 0, 0, pass ? fopen(path, "wb") : NULL };
+            clock_t     cpu = clock();
+            chunk_state x   = { now(), -1, 0, 0, pass ? fopen(path, "wb") : NULL };
             p.user_data   = &x;
             if (pt_synthesize(ctx, &p, NULL)) {
                 fprintf(stderr, "pt_synthesize: %s\n", pt_last_error());
@@ -223,8 +227,9 @@ static int say(const char * model, const char * voices, const char * voice_name,
             if (x.pcm) {
                 fclose(x.pcm);
             }
-            printf("%s{\"pass\": %d, \"i\": %d, \"ttfa\": %.4f, \"total\": %.4f, \"audio\": %.3f, \"chunks\": %d}",
-                   first_row ? "" : ", ", pass, i, x.first, total, (double) x.n / pt_sample_rate(ctx), x.chunks);
+            printf("%s{\"pass\": %d, \"i\": %d, \"ttfa\": %.4f, \"total\": %.4f, \"cpu\": %.4f, \"audio\": %.3f, \"chunks\": %d}",
+                   first_row ? "" : ", ", pass, i, x.first, total, (double) (clock() - cpu) / CLOCKS_PER_SEC,
+                   (double) x.n / pt_sample_rate(ctx), x.chunks);
             first_row = 0;
         }
         fclose(f);

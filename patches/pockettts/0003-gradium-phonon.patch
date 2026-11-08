@@ -1,0 +1,944 @@
+diff --git a/src/flow-lm.h b/src/flow-lm.h
+index c2acc5a..c605ff5 100644
+--- a/src/flow-lm.h
++++ b/src/flow-lm.h
+@@ -123,12 +123,17 @@ static ggml_tensor * flow_backbone(ggml_context *     ctx,
+     return x;
+ }
+ 
+-static ggml_tensor * flow_time_embed(ggml_context * ctx, const TimeEmbed & te, float t) {
++static ggml_tensor * flow_time_embed(ggml_context * ctx, const TimeEmbed & te, float t, bool time_rms) {
+     ggml_tensor * args = ggml_scale(ctx, te.freqs, t);
+     ggml_tensor * e    = ggml_concat(ctx, ggml_cos(ctx, args), ggml_sin(ctx, args), 0);
+     e                  = pt_linear(ctx, te.l0_w, te.l0_b, e);
+     e                  = pt_linear(ctx, te.l2_w, te.l2_b, ggml_silu(ctx, e));
+     const int64_t n    = e->ne[0];
++    if (time_rms) {
++        // Phonon: x * alpha / sqrt(mean(x^2) + eps)
++        ggml_tensor * ms = ggml_scale_bias(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, e)), 1.0f / (float) n, 1e-5f);
++        return ggml_div(ctx, ggml_mul(ctx, e, te.alpha), ggml_sqrt(ctx, ms));
++    }
+     ggml_tensor * d    = ggml_sub(ctx, e, ggml_mean(ctx, e));
+     ggml_tensor * var  = ggml_scale_bias(ctx, ggml_sum_rows(ctx, ggml_sqr(ctx, d)), 1.0f / (float) (n - 1), 1e-5f);
+     return ggml_div(ctx, ggml_mul(ctx, e, te.alpha), ggml_sqrt(ctx, var));
+@@ -153,10 +158,10 @@ static ggml_tensor * flow_head(ggml_context *    ctx,
+         const float   t = (float) (i + 1) / (float) n_steps;
+         ggml_tensor * y = yc;
+         if (hp.n_time_conds == 2) {
+-            ggml_tensor * te = ggml_add(ctx, flow_time_embed(ctx, w.temb[0], s), flow_time_embed(ctx, w.temb[1], t));
++            ggml_tensor * te = ggml_add(ctx, flow_time_embed(ctx, w.temb[0], s, hp.time_rms), flow_time_embed(ctx, w.temb[1], t, hp.time_rms));
+             y                = ggml_add(ctx, y, ggml_scale(ctx, te, 0.5f));
+         } else if (hp.n_time_conds == 1) {
+-            y = ggml_add(ctx, y, flow_time_embed(ctx, w.temb[0], s));
++            y = ggml_add(ctx, y, flow_time_embed(ctx, w.temb[0], s, hp.time_rms));
+         }
+         ggml_tensor * ys = ggml_silu(ctx, y);
+ 
+@@ -209,7 +214,7 @@ static FlowStep flow_build_step(ggml_context *    ctx,
+     ggml_set_input(st.noise);
+     st.in = flow_inputs(ctx, 1, n_kv);
+ 
+-    ggml_tensor * x = ggml_mul_mat(ctx, w.input_linear, st.latent);
++    ggml_tensor * x = pt_linear(ctx, w.input_linear, w.input_bias, st.latent);
+     x               = flow_backbone(ctx, gf, w, hp, kv, x, st.in, n_kv, o);
+     ggml_tensor * c = pt_layer_norm(ctx, x, w.out_norm_w, w.out_norm_b, 1e-5f);
+ 
+diff --git a/src/model.h b/src/model.h
+index a04bf31..81a6f1b 100644
+--- a/src/model.h
++++ b/src/model.h
+@@ -11,6 +11,13 @@
+ //   Mimi enc   PCM -> SEANet encoder -> windowed transformer -> strided conv
+ //              downsample -> speaker projection, for voice cloning
+ //
++// Gradium's Phonon checkpoints, Pocket TTS descendants, load from their GGUF
++// as published: it holds no keys, so the hyperparameters come from the
++// config.json beside it. Phonon has no Mimi encoder, a narrower flow LM, an
++// exact GELU, a plain RMS time embedding norm and summed conditioners, a
++// constant added to every generated frame's input, kept as an input_linear
++// bias. Its voices are speaker latents projected to prompt rows.
++//
+ // Tensor names are the reference state_dict names. Matmul weights keep
+ // their GGUF type (quantizable), vectors load as F32, conv kernels as F16
+ // (the ggml im2col path), transposed conv kernels as F32 pre-permuted for
+@@ -18,9 +25,13 @@
+ 
+ #include "gguf-weights.h"
+ #include "pt-error.h"
++#include "utf8.h"
+ #include "weight-ctx.h"
++#include "yyjson.h"
+ 
+ #include <cmath>
++#include <cstdio>
++#include <cstring>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -30,6 +41,7 @@
+ struct PTOpts {
+     bool fa;
+     bool clamp_fp16;
++    bool gelu_erf;  // exact GELU (Phonon), else the tanh approximation
+ };
+ 
+ struct PTHparams {
+@@ -79,6 +91,12 @@ struct PTHparams {
+     int                      frames_after_eos;
+     float                    temperature;
+ 
++    // Phonon checkpoint: no Mimi encoder, speaker latent voices, the
++    // reference runtime's generation rules
++    bool  phonon;
++    bool  time_rms;       // time embedding norm by the mean square, else the unbiased variance
++    float eos_threshold;  // default EOS logit threshold
++
+     // derived
+     int hop_length;       // product of the SEANet ratios, samples per encoder frame
+     int upsample_stride;  // encoder frames per latent frame
+@@ -148,6 +166,7 @@ struct PTWeights {
+     // flow LM
+     ggml_tensor *         embed;
+     ggml_tensor *         input_linear;
++    ggml_tensor *         input_bias;  // summed conditioners (Phonon), else null
+     ggml_tensor *         bos_before_voice;
+     ggml_tensor *         speaker_proj;
+     ggml_tensor *         emb_mean;
+@@ -187,6 +206,7 @@ struct PTWeights {
+ 
+     // host copies of the small vectors the pipeline reads
+     std::vector<float> bos_emb;
++    std::vector<float> speaker_wavs_proj;  // Phonon voice projection [dim][mimi_dim]
+ 
+     WeightCtx wctx;
+ };
+@@ -228,7 +248,116 @@ static std::vector<std::string> pt_str_array(const GGUFModel & gf, const char *
+     return out;
+ }
+ 
+-static void pt_load_hparams(PTHparams * hp, const GGUFModel & gf) {
++// A file beside the model, which may be given with / or \ separators.
++static std::string pt_sibling(const char * model_path, const char * name) {
++    std::string p = model_path;
++    size_t      s = p.find_last_of("/\\");
++    return (s == std::string::npos ? std::string() : p.substr(0, s + 1)) + name;
++}
++
++static std::vector<uint8_t> pt_read_file(const std::string & path) {
++    std::vector<uint8_t> data;
++    FILE *               f = utf8_fopen(path.c_str(), "rb");
++    if (!f) {
++        pt_throw("[Model] cannot open %s", path.c_str());
++    }
++    fseek(f, 0, SEEK_END);
++    long n = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    data.resize(n > 0 ? (size_t) n : 0);
++    bool ok = n > 0 && fread(data.data(), 1, data.size(), f) == data.size();
++    fclose(f);
++    if (!ok) {
++        pt_throw("[Model] cannot read %s", path.c_str());
++    }
++    return data;
++}
++
++static double pt_json_num(yyjson_val * o, const char * key) {
++    yyjson_val * v = yyjson_obj_get(o, key);
++    if (!yyjson_is_num(v)) {
++        pt_throw("[Model] config.json: missing number %s", key);
++    }
++    return yyjson_get_num(v);
++}
++
++static yyjson_val * pt_json_obj(yyjson_val * o, const char * key) {
++    yyjson_val * v = yyjson_obj_get(o, key);
++    if (!yyjson_is_obj(v)) {
++        pt_throw("[Model] config.json: missing object %s", key);
++    }
++    return v;
++}
++
++static void pt_load_phonon_hparams(PTHparams * hp, yyjson_val * root) {
++    yyjson_val * flow = pt_json_obj(root, "flow_lm");
++    yyjson_val * mimi = pt_json_obj(root, "mimi");
++    if (pt_json_num(root, "lsd_decode_steps") != 1) {
++        pt_throw("[Model] config.json: only lsd_decode_steps 1 is supported");
++    }
++    for (yyjson_val * sec : { flow, mimi }) {
++        const char * gelu = yyjson_get_str(yyjson_obj_get(sec, "gelu"));
++        if (gelu && strcmp(gelu, "erf") != 0) {
++            pt_throw("[Model] config.json: only the erf GELU is supported");
++        }
++    }
++    hp->phonon           = true;
++    hp->dim              = (int) pt_json_num(flow, "d_model");
++    hp->n_layers         = (int) pt_json_num(flow, "num_layers");
++    hp->n_heads          = (int) pt_json_num(flow, "num_heads");
++    hp->ffn_dim          = (int) pt_json_num(flow, "dim_feedforward");
++    hp->max_period       = (float) pt_json_num(flow, "max_period");
++    hp->ldim             = (int) pt_json_num(flow, "ldim");
++    hp->n_bins           = (int) pt_json_num(flow, "n_bins");
++    hp->bos_before_voice = false;
++    hp->head_dim         = (int) pt_json_num(flow, "flow_dim");
++    hp->head_depth       = (int) pt_json_num(flow, "flow_depth");
++    hp->n_time_conds     = 2;
++    const char * norm    = yyjson_get_str(yyjson_obj_get(flow, "time_rms_norm"));
++    hp->time_rms         = norm && strcmp(norm, "rms") == 0;
++
++    hp->sample_rate          = (int) pt_json_num(mimi, "sample_rate");
++    hp->frame_rate           = (float) pt_json_num(mimi, "frame_rate");
++    hp->mimi_dim             = (int) pt_json_num(mimi, "dimension");
++    hp->n_filters            = (int) pt_json_num(mimi, "n_filters");
++    hp->n_residual_layers    = (int) pt_json_num(mimi, "n_residual_layers");
++    hp->kernel_size          = (int) pt_json_num(mimi, "kernel_size");
++    hp->residual_kernel_size = (int) pt_json_num(mimi, "residual_kernel_size");
++    hp->last_kernel_size     = (int) pt_json_num(mimi, "last_kernel_size");
++    hp->dilation_base        = (int) pt_json_num(mimi, "dilation_base");
++    hp->compress             = (int) pt_json_num(mimi, "compress");
++    hp->inner_dim            = (int) pt_json_num(mimi, "quantizer_dimension");
++    hp->outer_dim            = (int) pt_json_num(mimi, "quantizer_output_dimension");
++    hp->tfm_dim              = (int) pt_json_num(mimi, "transformer_d_model");
++    hp->tfm_n_layers         = (int) pt_json_num(mimi, "transformer_num_layers");
++    hp->tfm_n_heads          = (int) pt_json_num(mimi, "transformer_num_heads");
++    hp->tfm_ffn_dim          = (int) pt_json_num(mimi, "transformer_dim_feedforward");
++    hp->tfm_context          = (int) pt_json_num(mimi, "transformer_context");
++    hp->tfm_max_period       = (float) pt_json_num(mimi, "transformer_max_period");
++    yyjson_val * ratios      = yyjson_obj_get(mimi, "ratios");
++    size_t       i, mx;
++    yyjson_val * r;
++    yyjson_arr_foreach(ratios, i, mx, r) {
++        hp->ratios.push_back((int) yyjson_get_num(r));
++    }
++    if (hp->ratios.empty()) {
++        pt_throw("[Model] config.json: missing mimi.ratios");
++    }
++
++    // The reference runtime's text preparation and sampling (it does not read the config's temp).
++    hp->pad_with_spaces             = false;
++    hp->remove_semicolons           = false;
++    hp->append_terminal_punctuation = true;
++    hp->capitalize_first_letter     = true;
++    hp->frames_after_eos            = -1;
++    hp->temperature                 = 0.3f;
++    hp->eos_threshold               = (float) pt_json_num(root, "eos_threshold");
++}
++
++static void pt_load_pocket_hparams(PTHparams * hp, const GGUFModel & gf) {
++    hp->phonon           = false;
++    hp->time_rms         = false;
++    hp->eos_threshold    = -4.0f;
+     hp->dim              = (int) pt_req_u32(gf, "pocket.flow.dim");
+     hp->n_layers         = (int) pt_req_u32(gf, "pocket.flow.n_layers");
+     hp->n_heads          = (int) pt_req_u32(gf, "pocket.flow.n_heads");
+@@ -274,16 +403,41 @@ static void pt_load_hparams(PTHparams * hp, const GGUFModel & gf) {
+     int64_t fae                     = gguf_find_key(gf.gguf, "pocket.gen.frames_after_eos");
+     hp->frames_after_eos            = fae < 0 ? -1 : gguf_get_val_i32(gf.gguf, fae);
+     hp->temperature                 = pt_req_f32(gf, "pocket.gen.temperature");
++    if (hp->replace_from.size() != hp->replace_to.size()) {
++        pt_throw("[Model] replace_from and replace_to differ in size");
++    }
++}
+ 
++// The config.json beside a Phonon GGUF, freed by the caller.
++static yyjson_doc * pt_read_config(const char * model_path) {
++    const std::string    path = pt_sibling(model_path, "config.json");
++    std::vector<uint8_t> data = pt_read_file(path);
++    yyjson_doc *         doc  = yyjson_read((const char *) data.data(), data.size(), YYJSON_READ_NOFLAG);
++    if (!doc) {
++        pt_throw("[Model] %s is not JSON", path.c_str());
++    }
++    return doc;
++}
++
++static void pt_load_hparams(PTHparams * hp, const GGUFModel & gf, const char * model_path) {
++    if (gguf_find_key(gf.gguf, "pocket.flow.dim") < 0) {
++        yyjson_doc * doc = pt_read_config(model_path);
++        try {
++            pt_load_phonon_hparams(hp, yyjson_doc_get_root(doc));
++        } catch (...) {
++            yyjson_doc_free(doc);
++            throw;
++        }
++        yyjson_doc_free(doc);
++    } else {
++        pt_load_pocket_hparams(hp, gf);
++    }
+     hp->hop_length = 1;
+     for (int r : hp->ratios) {
+         hp->hop_length *= r;
+     }
+     hp->upsample_stride = (int) std::lround((float) hp->sample_rate / (float) hp->hop_length / hp->frame_rate);
+     hp->frame_size      = hp->hop_length * hp->upsample_stride;
+-    if (hp->replace_from.size() != hp->replace_to.size()) {
+-        pt_throw("[Model] replace_from and replace_to differ in size");
+-    }
+ }
+ 
+ // ConvTranspose1d kernel, PyTorch (IC, OC, K) = ne [K, OC, IC], permuted to
+@@ -400,17 +554,125 @@ static std::vector<float> pt_host_f32(const GGUFModel & gf, const char * name) {
+     return out;
+ }
+ 
++// Phonon's summed conditioners at the reference runtime's defaults
++// (num_speakers 1, duration_delta 0): one constant [dim] vector that the
++// reference adds to every generated frame's input_linear output.
++static std::vector<float> pt_phonon_conditions(const GGUFModel & gf, const char * model_path, int dim) {
++    yyjson_doc *       doc  = pt_read_config(model_path);
++    yyjson_val *       root = yyjson_doc_get_root(doc);
++    yyjson_val *       sum  = yyjson_obj_get(yyjson_obj_get(root, "fuser"), "sum");
++    std::vector<float> total((size_t) dim, 0.0f);
++    try {
++        size_t       i, mx;
++        yyjson_val * cond;
++        yyjson_arr_foreach(yyjson_obj_get(root, "conditioners"), i, mx, cond) {
++            const char * name = yyjson_get_str(yyjson_obj_get(cond, "name"));
++            const char * type = yyjson_get_str(yyjson_obj_get(cond, "type"));
++            if (!name || !type) {
++                pt_throw("[Model] config.json: a conditioner has no name or type");
++            }
++            bool   summed = false;
++            size_t j, my;
++            yyjson_val * s;
++            yyjson_arr_foreach(sum, j, my, s) {
++                summed |= yyjson_equals_str(s, name);
++            }
++            const char * value = !strcmp(name, "num_speakers")                                     ? "1" :
++                                 !strcmp(name, "duration_delta") || !strcmp(name, "padding_bonus") ? "0" :
++                                                                                                     nullptr;
++            if (!summed || !value) {
++                pt_throw("[Model] config.json: conditioner %s is not supported", name);
++            }
++            const std::string  prefix = std::string("flow_lm.condition_provider.conditioners.") + name + ".";
++            std::vector<float> emb;
++            if (!strcmp(type, "lut")) {
++                yyjson_val * possible = yyjson_obj_get(yyjson_obj_get(cond, "lut"), "possible_values");
++                int          idx      = -1;
++                yyjson_val * v;
++                yyjson_arr_foreach(possible, j, my, v) {
++                    if (yyjson_equals_str(v, value)) {
++                        idx = (int) j;
++                    }
++                }
++                const std::string  tn    = prefix + "embed.weight";
++                ggml_tensor *      t     = ggml_get_tensor(gf.meta, tn.c_str());
++                std::vector<float> table = pt_host_f32(gf, tn.c_str());
++                if (idx < 0 || idx >= t->ne[1]) {
++                    pt_throw("[Model] conditioner %s cannot take %s", name, value);
++                }
++                emb.assign(table.begin() + idx * t->ne[0], table.begin() + (idx + 1) * t->ne[0]);
++            } else if (!strcmp(type, "continuous")) {
++                yyjson_val * c        = yyjson_obj_get(cond, "continuous");
++                const float  position = (float) pt_json_num(c, "scale_factor") * (float) atof(value);
++                const int    n        = (int) pt_json_num(c, "dim");
++                const float  period   = (float) pt_json_num(c, "max_period");
++                const int    half     = n / 2;
++                emb.resize((size_t) n);
++                for (int k = 0; k < half; k++) {
++                    const float phase = position / powf(period, (float) k / (float) (half - 1));
++                    emb[k]            = cosf(phase);
++                    emb[half + k]     = sinf(phase);
++                }
++            } else {
++                pt_throw("[Model] conditioner type %s is not supported", type);
++            }
++            const std::string proj = prefix + "output_proj.weight";
++            if (ggml_tensor * p = ggml_get_tensor(gf.meta, proj.c_str())) {
++                std::vector<float> w = pt_host_f32(gf, proj.c_str());
++                if (p->ne[0] != (int64_t) emb.size() || p->ne[1] != dim) {
++                    pt_throw("[Model] %s does not map %zu to %d", proj.c_str(), emb.size(), dim);
++                }
++                for (int o = 0; o < dim; o++) {
++                    float acc = 0.0f;
++                    for (size_t k = 0; k < emb.size(); k++) {
++                        acc += w[(size_t) o * emb.size() + k] * emb[k];
++                    }
++                    total[o] += acc;
++                }
++            } else if ((int) emb.size() == dim) {
++                for (int o = 0; o < dim; o++) {
++                    total[o] += emb[o];
++                }
++            } else {
++                pt_throw("[Model] conditioner %s has no projection to %d", name, dim);
++            }
++        }
++    } catch (...) {
++        yyjson_doc_free(doc);
++        throw;
++    }
++    yyjson_doc_free(doc);
++    return total;
++}
++
+ // SEANet module indices follow the reference nn.ModuleList: the decoder
+ // is [conv, (ELU, convtr, res * n)* per ratio, ELU, conv], the encoder
+ // [conv, (res * n, ELU, conv)* per reversed ratio, ELU, conv].
+-static void pt_load_weights(PTWeights * w, const PTHparams & hp, const GGUFModel & gf, ggml_backend_t backend) {
++static void pt_load_weights(PTWeights *       w,
++                            const PTHparams & hp,
++                            const GGUFModel & gf,
++                            ggml_backend_t    backend,
++                            const char *      model_path) {
+     wctx_init(&w->wctx, (int) gguf_get_n_tensors(gf.gguf) + 16);
+     WeightCtx * wc = &w->wctx;
+ 
+-    w->embed            = gf_load_tensor(wc, gf, "flow_lm.conditioner.embed.weight");
++    const std::string cp = "flow_lm.condition_provider.conditioners.";
++    w->embed = hp.phonon ? gf_load_tensor_f32(wc, gf, cp + "transcript_in_segment.embed.weight") :
++                           gf_load_tensor(wc, gf, "flow_lm.conditioner.embed.weight");
+     w->input_linear     = gf_load_tensor(wc, gf, "flow_lm.input_linear.weight");
++    w->input_bias       = nullptr;
+     w->bos_before_voice = hp.bos_before_voice ? gf_load_tensor_f32(wc, gf, "flow_lm.bos_before_voice") : nullptr;
+-    w->speaker_proj     = gf_load_tensor(wc, gf, "flow_lm.speaker_proj_weight");
++    w->speaker_proj     = hp.phonon ? nullptr : gf_load_tensor(wc, gf, "flow_lm.speaker_proj_weight");
++    if (hp.phonon) {
++        w->speaker_wavs_proj = pt_host_f32(gf, (cp + "speaker_wavs.output_proj.weight").c_str());
++        std::vector<float> bias = pt_phonon_conditions(gf, model_path, hp.dim);
++        auto               buf  = std::make_unique<float[]>(bias.size());
++        memcpy(buf.get(), bias.data(), bias.size() * sizeof(float));
++        w->input_bias = ggml_new_tensor_1d(wc->ctx, GGML_TYPE_F32, hp.dim);
++        ggml_set_name(w->input_bias, "flow_lm.input_bias");
++        wc->pending.push_back({ w->input_bias, buf.get(), bias.size() * sizeof(float), 0 });
++        wc->staging.push_back(std::move(buf));
++    }
+     w->emb_mean         = gf_load_tensor_f32(wc, gf, "flow_lm.emb_mean");
+     w->emb_std          = gf_load_tensor_f32(wc, gf, "flow_lm.emb_std");
+     w->out_norm_w       = gf_load_tensor_f32(wc, gf, "flow_lm.out_norm.weight");
+@@ -456,7 +718,9 @@ static void pt_load_weights(PTWeights * w, const PTHparams & hp, const GGUFModel
+     w->final_b     = gf_load_tensor_f32(wc, gf, fh + "final_layer.linear.bias");
+ 
+     // Mimi decoder
+-    w->quant_proj = gf_load_tensor(wc, gf, "mimi.quantizer.output_proj.weight");
++    // Phonon stores this projection as a [1, inner, outer] conv kernel.
++    const int64_t qp[2] = { hp.inner_dim, hp.outer_dim };
++    w->quant_proj       = gf_load_tensor(wc, gf, "mimi.quantizer.output_proj.weight", qp, 2);
+     w->upsample_w = gf_load_tensor_f32(wc, gf, "mimi.upsample.convtr.convtr.weight");
+     for (int i = 0; i < hp.tfm_n_layers; i++) {
+         w->dec_layers.push_back(
+@@ -480,7 +744,14 @@ static void pt_load_weights(PTWeights * w, const PTHparams & hp, const GGUFModel
+     idx++;  // ELU
+     w->dec_out = pt_load_conv(wc, gf, "mimi.decoder.model." + std::to_string(idx) + ".conv", 1, 1, true);
+ 
+-    // Mimi encoder
++    // Mimi encoder, which Phonon checkpoints do not have
++    w->bos_emb = pt_host_f32(gf, "flow_lm.bos_emb");
++    if (hp.phonon) {
++        if (!wctx_alloc(wc, backend)) {
++            pt_throw("[Model] weight allocation failed");
++        }
++        return;
++    }
+     idx       = 0;
+     w->enc_in = pt_load_conv(wc, gf, "mimi.encoder.model." + std::to_string(idx++) + ".conv", 1, 1, true);
+     for (auto it = hp.ratios.rbegin(); it != hp.ratios.rend(); ++it) {
+@@ -504,8 +775,6 @@ static void pt_load_weights(PTWeights * w, const PTHparams & hp, const GGUFModel
+     }
+     w->downsample = pt_load_conv(wc, gf, "mimi.downsample.conv.conv", hp.upsample_stride, 1, false);
+ 
+-    w->bos_emb = pt_host_f32(gf, "flow_lm.bos_emb");
+-
+     if (!wctx_alloc(wc, backend)) {
+         pt_throw("[Model] weight allocation failed");
+     }
+diff --git a/src/pocket.cpp b/src/pocket.cpp
+index 5bc392b..95fa284 100644
+--- a/src/pocket.cpp
++++ b/src/pocket.cpp
+@@ -12,6 +12,9 @@
+ // encoder cold start frame that opens the training sequences and decodes
+ // to a short click ahead of the speech.
+ //
++// A Phonon model follows its reference runtime instead: EOS counts from the
++// first frame, frames_after_eos is one less, and no audio is dropped.
++//
+ // The noise of every step comes from a torch compatible generator seeded
+ // once per synthesis; each text prefill draws one discarded noise vector
+ // like the reference forward does, so a seed gives the reference noise.
+@@ -334,9 +337,14 @@ struct pt_context * pt_init(const struct pt_init_params * params) {
+         if (!gf_load(&gf, params->model_path)) {
+             pt_throw("pt_init: cannot load %s", params->model_path);
+         }
+-        pt_load_hparams(&c->hp, gf);
+-        tok_load(&c->tok, gf);
+-        pt_load_weights(&c->w, c->hp, gf, c->backend);
++        pt_load_hparams(&c->hp, gf, params->model_path);
++        if (c->hp.phonon) {
++            tok_load_spm(&c->tok, pt_read_file(pt_sibling(params->model_path, "tokenizer.model")));
++        } else {
++            tok_load(&c->tok, gf);
++        }
++        c->opts.gelu_erf = c->hp.phonon;
++        pt_load_weights(&c->w, c->hp, gf, c->backend, params->model_path);
+         if (c->hp.bos_before_voice) {
+             c->bos_voice = pt_host_f32(gf, "flow_lm.bos_before_voice");
+         }
+@@ -374,11 +382,73 @@ int pt_sample_rate(const struct pt_context * c) {
+     return c ? c->hp.sample_rate : 0;
+ }
+ 
++}  // extern "C"
++
++// Prefills the L prompt rows [dim, L] from position 0 and keeps the KV rows
++// as a voice. The caller holds c->mu.
++static pt_voice * pt_voice_from_prompt(pt_context * c, const std::vector<float> & prompt, int L, const char * what) {
++    const PTHparams & hp = c->hp;
++    if (!flow_kv_ensure(&c->kv, hp, c->backend, L)) {
++        pt_set_error("%s: KV cache allocation failed", what);
++        return nullptr;
++    }
++    if (!pt_prefill(c, prompt.data(), nullptr, L, 0, nullptr)) {
++        return nullptr;
++    }
++    pt_voice * v      = new pt_voice();
++    v->n_heads        = hp.n_heads;
++    v->st.n_layers    = hp.n_layers;
++    v->st.dim         = hp.dim;
++    v->st.n           = L;
++    const size_t rows = (size_t) L * hp.dim;
++    v->st.k.resize(rows * hp.n_layers);
++    v->st.v.resize(rows * hp.n_layers);
++    for (int l = 0; l < hp.n_layers; l++) {
++        ggml_backend_tensor_get(c->kv.k[l], v->st.k.data() + l * rows, 0, rows * sizeof(float));
++        ggml_backend_tensor_get(c->kv.v[l], v->st.v.data() + l * rows, 0, rows * sizeof(float));
++    }
++    return v;
++}
++
++// A Phonon voice file: its speaker latents through the speaker projection.
++static pt_voice * pt_voice_from_speaker_wavs(pt_context * c, const char * path) {
++    const PTHparams &  hp = c->hp;
++    const int          C  = (int) (c->w.speaker_wavs_proj.size() / hp.dim);
++    std::vector<float> lat;
++    int                T = 0;
++    if (!voice_load_speaker_wavs(path, C, lat, &T)) {
++        return nullptr;
++    }
++    std::vector<float> prompt((size_t) hp.dim * T);
++    const float *      W = c->w.speaker_wavs_proj.data();
++    for (int t = 0; t < T; t++) {
++        for (int o = 0; o < hp.dim; o++) {
++            float acc = 0.0f;
++            for (int k = 0; k < C; k++) {
++                acc += W[(size_t) o * C + k] * lat[(size_t) t * C + k];
++            }
++            prompt[(size_t) t * hp.dim + o] = acc;
++        }
++    }
++    std::lock_guard<std::mutex> lock(c->mu);
++    pt_voice *                  v = pt_voice_from_prompt(c, prompt, T, "pt_voice_load");
++    if (v) {
++        pt_log(PT_LOG_INFO, "[Voice] %s: %d prompt frames", path, T);
++    }
++    return v;
++}
++
++extern "C" {
++
+ struct pt_voice * pt_voice_from_audio(struct pt_context * c, const float * samples, int n_samples, int sample_rate) {
+     if (!c || !samples || n_samples <= 0 || sample_rate <= 0) {
+         pt_set_error("pt_voice_from_audio: invalid arguments");
+         return nullptr;
+     }
++    if (c->hp.phonon) {
++        pt_set_error("pt_voice_from_audio: this model has no Mimi encoder; load a voice file instead");
++        return nullptr;
++    }
+     std::lock_guard<std::mutex> lock(c->mu);
+     const PTHparams &           hp = c->hp;
+     Timer                       t;
+@@ -418,25 +488,10 @@ struct pt_voice * pt_voice_from_audio(struct pt_context * c, const float * sampl
+     ggml_backend_tensor_get(e.out, prompt.data() + (L - Tf) * (size_t) hp.dim, 0, (size_t) hp.dim * Tf * sizeof(float));
+     const double t_enc = t.ms();
+ 
+-    if (!flow_kv_ensure(&c->kv, hp, c->backend, L)) {
+-        pt_set_error("pt_voice_from_audio: KV cache allocation failed");
+-        return nullptr;
+-    }
+-    if (!pt_prefill(c, prompt.data(), nullptr, L, 0, nullptr)) {
++    pt_voice * v = pt_voice_from_prompt(c, prompt, L, "pt_voice_from_audio");
++    if (!v) {
+         return nullptr;
+     }
+-    pt_voice * v      = new pt_voice();
+-    v->n_heads        = hp.n_heads;
+-    v->st.n_layers    = hp.n_layers;
+-    v->st.dim         = hp.dim;
+-    v->st.n           = L;
+-    const size_t rows = (size_t) L * hp.dim;
+-    v->st.k.resize(rows * hp.n_layers);
+-    v->st.v.resize(rows * hp.n_layers);
+-    for (int l = 0; l < hp.n_layers; l++) {
+-        ggml_backend_tensor_get(c->kv.k[l], v->st.k.data() + l * rows, 0, rows * sizeof(float));
+-        ggml_backend_tensor_get(c->kv.v[l], v->st.v.data() + l * rows, 0, rows * sizeof(float));
+-    }
+     pt_log(PT_LOG_INFO, "[Voice] %.2f s of audio -> %d prompt frames (encode %.0f ms, prefill %.0f ms)",
+            (double) n_samples / sample_rate, L, t_enc, t.ms() - t_enc);
+     return v;
+@@ -448,6 +503,9 @@ struct pt_voice * pt_voice_load(struct pt_context * c, const char * path, float
+         return nullptr;
+     }
+     const size_t n = strlen(path);
++    if (n > 12 && strcmp(path + n - 12, ".safetensors") == 0 && c->hp.phonon) {
++        return pt_voice_from_speaker_wavs(c, path);
++    }
+     if (n > 12 && strcmp(path + n - 12, ".safetensors") == 0) {
+         pt_voice * v = new pt_voice();
+         v->n_heads   = c->hp.n_heads;
+@@ -526,7 +584,7 @@ void pt_tts_default_params(struct pt_tts_params * p) {
+     p->abi_version      = PT_ABI_VERSION;
+     p->temperature      = -1.0f;
+     p->lsd_steps        = 1;
+-    p->eos_threshold    = -4.0f;
++    p->eos_threshold    = NAN;
+     p->frames_after_eos = -1;
+     p->max_chunk_tokens = 50;
+     p->seed             = UINT32_MAX;
+@@ -568,6 +626,7 @@ int pt_synthesize(struct pt_context * c, const struct pt_tts_params * p, struct
+         debug_dump_2d(&dump, "voice-v-last", vo.v.data() + (size_t) (vo.n_layers - 1) * rows, vo.n, vo.dim);
+     }
+     const float    temp = p->temperature < 0.0f ? hp.temperature : p->temperature;
++    const float    eos_threshold = std::isnan(p->eos_threshold) ? hp.eos_threshold : p->eos_threshold;
+     const float    stdv = sqrtf(temp);
+     const uint32_t seed = p->seed == UINT32_MAX ? std::random_device{}() : p->seed;
+     TorchRng       rng(seed);
+@@ -615,13 +674,15 @@ int pt_synthesize(struct pt_context * c, const struct pt_tts_params * p, struct
+         tp_prepare(hp, chunks[ci], &text, &guess);
+         // hearsay: a comma before every chunk, so speech starts after the first frame, whose
+         // audio is dropped; without it a short first word such as "I" is lost with that frame.
+-        text = ", " + text;
++        if (!hp.phonon) {
++            text = ", " + text;
++        }
+         std::vector<int>     ids = tok_encode(c->tok, text);
+         std::vector<int32_t> ids32(ids.begin(), ids.end());
+         const int            ntok    = (int) ids.size();
+         const int            fae     = p->frames_after_eos >= 0 ? p->frames_after_eos :
+                                        hp.frames_after_eos >= 0 ? hp.frames_after_eos :
+-                                                                  guess + 2;
++                                                                  guess + (hp.phonon ? 1 : 2);
+         const int            max_gen = (int) std::ceil(((double) ntok / 3.0 + 2.0) * (double) hp.frame_rate);
+ 
+         if (!flow_kv_ensure(&c->kv, hp, c->backend, vo.n + ntok + max_gen + 1)) {
+@@ -643,7 +704,7 @@ int pt_synthesize(struct pt_context * c, const struct pt_tts_params * p, struct
+         const double ms_pre = t_pre.ms();
+ 
+         mimi_state_reset(&c->ms);
+-        skip = (size_t) hp.frame_size;
++        skip = hp.phonon ? 0 : (size_t) hp.frame_size;
+         latent.assign(c->w.bos_emb.begin(), c->w.bos_emb.end());
+         pending.clear();
+         int n_past   = vo.n + ntok;
+@@ -669,7 +730,7 @@ int pt_synthesize(struct pt_context * c, const struct pt_tts_params * p, struct
+                 dump_eos.push_back(eos);
+             }
+             n_past++;
+-            if (eos > p->eos_threshold && eos_step < 0 && step >= PT_EOS_MIN_FRAMES) {
++            if (eos > eos_threshold && eos_step < 0 && (hp.phonon || step >= PT_EOS_MIN_FRAMES)) {
+                 eos_step = step;
+             }
+             if (eos_step >= 0 && step >= eos_step + fae) {
+diff --git a/src/pocket.h b/src/pocket.h
+index 3bcdcd1..e7eec36 100644
+--- a/src/pocket.h
++++ b/src/pocket.h
+@@ -86,7 +86,8 @@ struct pt_voice;
+ // FP16 range, for CUDA targets before Ampere that accumulate in FP16.
+ struct pt_init_params {
+     int          abi_version;
+-    const char * model_path;  // pocket-tts-<pack>-<type>.gguf
++    const char * model_path;  // pocket-tts-<pack>-<type>.gguf, or a Phonon model.*.gguf
++                              // with its config.json and tokenizer.model beside it
+     bool         use_fa;
+     bool         clamp_fp16;
+     const char * device;  // GGML device by name (CUDA0, Vulkan0, MTL0, CPU...),
+@@ -103,7 +104,9 @@ PT_API int pt_sample_rate(const struct pt_context * ctx);
+ 
+ // Voice from a file: a .safetensors voice state in the reference layout
+ // (the predefined voices of the pack, or one written by pt_voice_save),
+-// or any WAV recording encoded through the Mimi encoder. max_sec > 0
++// or any WAV recording encoded through the Mimi encoder. With a Phonon
++// model, a .safetensors file is a speaker_wavs voice (gradium/phonon-voices),
++// and recordings are not supported: Phonon has no Mimi encoder. max_sec > 0
+ // keeps only the first max_sec seconds of a recording. NULL on failure.
+ PT_API struct pt_voice * pt_voice_load(struct pt_context * ctx, const char * path, float max_sec);
+ 
+@@ -136,7 +139,7 @@ struct pt_tts_params {
+ 
+     float    temperature;       // noise variance of the flow head, < 0 keeps the pack default
+     int      lsd_steps;         // flow integration steps, 1 for the released packs
+-    float    eos_threshold;     // EOS logit threshold
++    float    eos_threshold;     // EOS logit threshold, NAN keeps the model default
+     int      frames_after_eos;  // frames kept after EOS, < 0 derives it from the text
+     int      max_chunk_tokens;  // text chunk budget in tokens
+     uint32_t seed;              // UINT32_MAX draws a random seed
+@@ -148,7 +151,7 @@ struct pt_tts_params {
+ };
+ 
+ // Reference defaults: temperature -1 (pack default), lsd_steps 1,
+-// eos_threshold -4, frames_after_eos -1, max_chunk_tokens 50, seed
++// eos_threshold NAN (-4 for Pocket TTS, config.json's for Phonon), frames_after_eos -1, max_chunk_tokens 50, seed
+ // UINT32_MAX, no streaming.
+ PT_API void pt_tts_default_params(struct pt_tts_params * p);
+ 
+diff --git a/src/tokenizer.h b/src/tokenizer.h
+index b943f3d..7f6aa07 100644
+--- a/src/tokenizer.h
++++ b/src/tokenizer.h
+@@ -8,6 +8,9 @@
+ // unknown edge scored min_score - 10 and is emitted as its UTF-8 bytes
+ // (<0xXX> pieces). Ties keep the first (shortest) candidate.
+ //
++// Phonon ships the SentencePiece model itself (tokenizer.model), read by
++// tok_load_spm: the same Unigram with byte fallback, and no normalization.
++//
+ // Decode: U+2581 back to spaces with the leading space of the first piece
+ // dropped, runs of <0xXX> pieces reassembled into UTF-8.
+ 
+@@ -15,6 +18,8 @@
+ #include "pt-error.h"
+ 
+ #include <cstdint>
++#include <cstdio>
++#include <cstring>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -34,6 +39,33 @@ static int utf8_len(unsigned char c) {
+     return c < 0x80 ? 1 : (c >> 5) == 0x6 ? 2 : (c >> 4) == 0xe ? 3 : (c >> 3) == 0x1e ? 4 : 1;
+ }
+ 
++// Adds piece i. control: a piece the encoder never produces.
++static void tok_add(PTTokenizer * t, const std::string & p, float score, bool control) {
++    const int    i = (int) t->pieces.size();
++    unsigned int b;
++    t->pieces.push_back(p);
++    t->scores.push_back(score);
++    if (p.size() == 6 && sscanf(p.c_str(), "<0x%02X>", &b) == 1) {
++        t->byte_ids[b] = i;
++        return;
++    }
++    if (control || p == "<unk>" || p == "<s>" || p == "</s>" || p == "<pad>") {
++        return;
++    }
++    t->ids.emplace(p, i);
++    if ((int) p.size() > t->max_len) {
++        t->max_len = (int) p.size();
++    }
++}
++
++static void tok_finish(PTTokenizer * t) {
++    float mn = 0.0f;
++    for (float s : t->scores) {
++        mn = s < mn ? s : mn;
++    }
++    t->unk_score = mn - 10.0f;
++}
++
+ static void tok_load(PTTokenizer * t, const GGUFModel & gf) {
+     int64_t kt = gguf_find_key(gf.gguf, "tokenizer.ggml.tokens");
+     int64_t ks = gguf_find_key(gf.gguf, "tokenizer.ggml.scores");
+@@ -42,31 +74,110 @@ static void tok_load(PTTokenizer * t, const GGUFModel & gf) {
+     }
+     const size_t  n  = gguf_get_arr_n(gf.gguf, kt);
+     const float * sc = (const float *) gguf_get_arr_data(gf.gguf, ks);
+-    float         mn = 0.0f;
+     for (int i = 0; i < 256; i++) {
+         t->byte_ids[i] = -1;
+     }
+     for (size_t i = 0; i < n; i++) {
+-        std::string p = gguf_get_arr_str(gf.gguf, kt, i);
+-        t->pieces.push_back(p);
+-        t->scores.push_back(sc[i]);
+-        if (sc[i] < mn) {
+-            mn = sc[i];
++        tok_add(t, gguf_get_arr_str(gf.gguf, kt, i), sc[i], false);
++    }
++    tok_finish(t);
++}
++
++// SentencePiece ModelProto: field 1 holds each piece as a message of
++// piece (1, string), score (2, float) and type (3, enum: 3 control).
++static bool tok_varint(const uint8_t *& p, const uint8_t * end, uint64_t * v) {
++    *v = 0;
++    for (int s = 0; p < end && s < 64; s += 7) {
++        const uint8_t b = *p++;
++        *v |= (uint64_t) (b & 0x7f) << s;
++        if (!(b & 0x80)) {
++            return true;
+         }
+-        unsigned int b;
+-        if (p.size() == 6 && sscanf(p.c_str(), "<0x%02X>", &b) == 1) {
+-            t->byte_ids[b] = (int) i;
+-            continue;
++    }
++    return false;
++}
++
++// Skips a field of wire type w, false on a malformed message.
++static bool tok_skip(const uint8_t *& p, const uint8_t * end, uint64_t w) {
++    uint64_t n = 0;
++    switch (w) {
++        case 0:
++            return tok_varint(p, end, &n);
++        case 1:
++            n = 8;
++            break;
++        case 2:
++            if (!tok_varint(p, end, &n)) {
++                return false;
++            }
++            break;
++        case 5:
++            n = 4;
++            break;
++        default:
++            return false;
++    }
++    if (n > (uint64_t) (end - p)) {
++        return false;
++    }
++    p += n;
++    return true;
++}
++
++static void tok_load_spm(PTTokenizer * t, const std::vector<uint8_t> & data) {
++    for (int i = 0; i < 256; i++) {
++        t->byte_ids[i] = -1;
++    }
++    const uint8_t * p   = data.data();
++    const uint8_t * end = p + data.size();
++    while (p < end) {
++        uint64_t key;
++        if (!tok_varint(p, end, &key)) {
++            pt_throw("[Tokenizer] malformed tokenizer.model");
+         }
+-        if (p == "<unk>" || p == "<s>" || p == "</s>" || p == "<pad>") {
++        if (key != ((1 << 3) | 2)) {
++            if (!tok_skip(p, end, key & 7)) {
++                pt_throw("[Tokenizer] malformed tokenizer.model");
++            }
+             continue;
+         }
+-        t->ids.emplace(p, (int) i);
+-        if ((int) p.size() > t->max_len) {
+-            t->max_len = (int) p.size();
++        uint64_t len;
++        if (!tok_varint(p, end, &len) || len > (uint64_t) (end - p)) {
++            pt_throw("[Tokenizer] malformed tokenizer.model");
++        }
++        const uint8_t * q     = p;
++        const uint8_t * qend  = p + len;
++        std::string     piece;
++        float           score = 0.0f;
++        uint64_t        type  = 1;
++        while (q < qend) {
++            uint64_t k;
++            if (!tok_varint(q, qend, &k)) {
++                pt_throw("[Tokenizer] malformed tokenizer.model");
++            }
++            if (k == ((1 << 3) | 2)) {
++                uint64_t n;
++                if (!tok_varint(q, qend, &n) || n > (uint64_t) (qend - q)) {
++                    pt_throw("[Tokenizer] malformed tokenizer.model");
++                }
++                piece.assign((const char *) q, (size_t) n);
++                q += n;
++            } else if (k == ((2 << 3) | 5) && qend - q >= 4) {
++                memcpy(&score, q, 4);
++                q += 4;
++            } else if (k == ((3 << 3) | 0)) {
++                tok_varint(q, qend, &type);
++            } else if (!tok_skip(q, qend, k & 7)) {
++                pt_throw("[Tokenizer] malformed tokenizer.model");
++            }
+         }
++        tok_add(t, piece, score, type == 3);
++        p = qend;
+     }
+-    t->unk_score = mn - 10.0f;
++    if (t->pieces.empty()) {
++        pt_throw("[Tokenizer] no pieces in tokenizer.model");
++    }
++    tok_finish(t);
+ }
+ 
+ static void tok_encode_piece(const PTTokenizer & t, const std::string & s, std::vector<int> & out) {
+diff --git a/src/transformer.h b/src/transformer.h
+index 78daf42..f7e4b21 100644
+--- a/src/transformer.h
++++ b/src/transformer.h
+@@ -129,7 +129,8 @@ static ggml_tensor * pt_attn(ggml_context * ctx,
+ 
+ static ggml_tensor * pt_ffn(ggml_context * ctx, const TfmLayer & L, ggml_tensor * x, const PTOpts & o) {
+     ggml_tensor * h = pt_layer_norm(ctx, x, L.norm2_w, L.norm2_b, 1e-5f);
+-    h               = ggml_gelu(ctx, ggml_mul_mat(ctx, L.linear1, h));
++    h               = ggml_mul_mat(ctx, L.linear1, h);
++    h               = o.gelu_erf ? ggml_gelu_erf(ctx, h) : ggml_gelu(ctx, h);
+     h               = ggml_mul_mat(ctx, L.linear2, h);
+     if (L.ls2) {
+         h = ggml_mul(ctx, h, L.ls2);
+diff --git a/src/voice.h b/src/voice.h
+index 7861ab8..1f48137 100644
+--- a/src/voice.h
++++ b/src/voice.h
+@@ -10,6 +10,9 @@
+ //   transformer.layers.{i}.self_attn/pad     I64 [1]                0
+ // A [T, H, hd] block is exactly T cache rows of C = H * hd floats, the
+ // flow LM KV cache layout.
++//
++// Phonon voice file (gradium/phonon-voices): speaker_wavs F32 [1, C, T],
++// speaker latents the model projects to its T prompt rows.
+ 
+ #include "gguf-weights.h"
+ #include "pt-error.h"
+@@ -135,6 +138,50 @@ static bool voice_load_safetensors(PTVoice * vo, const char * path, int n_layers
+     return voice_parse_safetensors(vo, data, path, n_layers, dim);
+ }
+ 
++// Reads a Phonon voice file's latents as [T][C]; false if it has none.
++static bool voice_load_speaker_wavs(const char * path, int channels, std::vector<float> & latents, int * T) {
++    std::vector<uint8_t> data;
++    if (!voice_read_file(path, data) || data.size() < 8) {
++        pt_set_error("voice: cannot read %s", path);
++        return false;
++    }
++    uint64_t hn;
++    memcpy(&hn, data.data(), 8);
++    if (8 + hn > data.size()) {
++        pt_set_error("voice: %s has a truncated header", path);
++        return false;
++    }
++    yyjson_doc * doc = yyjson_read((const char *) data.data() + 8, (size_t) hn, YYJSON_READ_NOFLAG);
++    if (!doc) {
++        pt_set_error("voice: %s has an invalid header", path);
++        return false;
++    }
++    yyjson_val * t     = yyjson_obj_get(yyjson_doc_get_root(doc), "speaker_wavs");
++    yyjson_val * shape = yyjson_obj_get(t, "shape");
++    yyjson_val * off   = yyjson_obj_get(t, "data_offsets");
++    const char * dt    = yyjson_get_str(yyjson_obj_get(t, "dtype"));
++    const size_t nd    = yyjson_arr_size(shape);
++    const int64_t C    = nd >= 2 ? yyjson_get_int(yyjson_arr_get(shape, nd - 2)) : 0;
++    const int64_t n    = nd >= 2 ? yyjson_get_int(yyjson_arr_get(shape, nd - 1)) : 0;
++    const uint64_t a   = yyjson_get_uint(yyjson_arr_get(off, 0));
++    const uint64_t b   = yyjson_get_uint(yyjson_arr_get(off, 1));
++    yyjson_doc_free(doc);
++    if (!t || !dt || strcmp(dt, "F32") != 0 || (nd != 2 && nd != 3) || C != channels || n <= 0 ||
++        b - a != (uint64_t) (C * n * 4) || 8 + hn + b > data.size()) {
++        pt_set_error("voice: %s holds no speaker_wavs F32 [1, %d, T] latents", path, channels);
++        return false;
++    }
++    const uint8_t * src = data.data() + 8 + hn + a;
++    latents.resize((size_t) (C * n));
++    for (int64_t c = 0; c < C; c++) {
++        for (int64_t i = 0; i < n; i++) {
++            memcpy(&latents[(size_t) (i * C + c)], src + (size_t) (c * n + i) * 4, 4);
++        }
++    }
++    *T = (int) n;
++    return true;
++}
++
+ static bool voice_load_gguf(PTVoice * vo, const char * path, const char * name, int n_layers, int dim) {
+     GGUFModel gf;
+     if (!gf_load(&gf, path)) {

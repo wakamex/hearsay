@@ -3,7 +3,7 @@
 hearsay is the local speech engine for gear, a voice front-end for coding agents: it hears, turning speech into text, and says, turning text into speech, in one small native build, on the CPU or, optionally, on the GPU through [Vulkan](https://www.vulkan.org/). It compiles only the parts of three upstream projects that its callers ask for against a single copy of the [ggml](https://github.com/ggml-org/ggml) tensor library:
 
 - Hearing: NVIDIA's Parakeet models, such as [Parakeet TDT-CTC 110M](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m), through [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), with only its Parakeet family built, and optionally OpenAI's [Whisper](https://github.com/openai/whisper) models from the same library, from GGUF or whisper.cpp `.bin` files, and [Silero VAD](https://github.com/snakers4/silero-vad), for telling speech from other sound.
-- Saying: Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) through [pockettts.cpp](https://github.com/ServeurpersoCom/pockettts.cpp), which streams audio as it is generated, without its command-line tool and HTTP server, and optionally Alibaba's [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (base models that clone a voice from a recording, custom-voice models with named speakers, and voice-design models that take a description of the voice) through [qwentts.cpp](https://github.com/ServeurpersoCom/qwentts.cpp), by the same author.
+- Saying: Kyutai's [Pocket TTS](https://github.com/kyutai-labs/pocket-tts) through [pockettts.cpp](https://github.com/ServeurpersoCom/pockettts.cpp), which streams audio as it is generated, without its command-line tool and HTTP server; through the same library, Gradium's [Phonon](https://huggingface.co/gradium/phonon-31m-en), a smaller descendant of Pocket TTS, with the voices of [phonon-voices](https://huggingface.co/gradium/phonon-voices); and optionally Alibaba's [Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS) (base models that clone a voice from a recording, custom-voice models with named speakers, and voice-design models that take a description of the voice) through [qwentts.cpp](https://github.com/ServeurpersoCom/qwentts.cpp), by the same author.
 
 The projects are fetched at pinned commits and changed only by the patch files in `patches/`. The GPU build also fetches the Khronos [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) and [SPIRV-Headers](https://github.com/KhronosGroup/SPIRV-Headers) at pinned releases.
 
@@ -56,6 +56,35 @@ Parity checks:
 
 Size: a `hearsay-bench` with only Whisper is 2.1 MB stripped, with only Qwen3-TTS 2.1 MB, and with Parakeet, Whisper, Pocket TTS and Qwen3-TTS 3.0 MB.
 
+## Phonon against Gradium's runtime
+
+[Phonon](https://huggingface.co/gradium/phonon-31m-en) is Gradium's 31-million-parameter English model built on Pocket TTS: the same flow LM and Mimi decoder at half the width (512), with about 100 voices in [phonon-voices](https://huggingface.co/gradium/phonon-voices). `patches/pockettts/0003` runs it in pockettts.cpp from Gradium's own files, and these rows compare it with Gradium's runtime, the `ptts` 0.6.0 Python package ([xn-ptts](https://github.com/gradium-ai/xn-ptts)), on the Ryzen 7 3800XT under WSL2. Both read the same `model.q8.gguf` (the flow transformer in Q8_0, the rest in BF16), use the Delia voice and seed 42, and synthesize gear's 8 replies, timing the second pass; `ptts` streams through its Python API with `lang="none"`. Each figure is the mean of two alternating runs, which agreed to within 3%.
+
+| Threads | Build | Speed vs real time | First audio, median (worst) | CPU-seconds per second of audio | Peak memory |
+| ---: | --- | ---: | ---: | ---: | ---: |
+| 1 | Gradium's runtime | 4.9x | 0.08 s (0.09 s) | 0.28 | 0.32 GB |
+| 1 | hearsay | 2.0x | 0.08 s (0.10 s) | 0.49 | 0.16 GB |
+| 2 | Gradium's runtime | 6.6x | 0.05 s (0.06 s) | 0.35 | 0.34 GB |
+| 2 | hearsay | 3.4x | 0.05 s (0.06 s) | 0.55 | 0.16 GB |
+| 8 | Gradium's runtime | 8.5x | 0.04 s (0.05 s) | 0.81 | 0.53 GB |
+| 8 | hearsay | 6.1x | 0.03 s (0.06 s) | 1.11 | 0.16 GB |
+
+hearsay reaches first audio as fast and with half the memory, but needs 1.4 to 1.8 times the CPU. Its Mimi decoder takes most of it: 31 ms of each 80 ms frame on one thread against 7.5 ms for the flow LM step, and pockettts.cpp's decoder costs the same for Pocket TTS (33 ms per frame). On an RTX 3080 under Windows 11 the Vulkan build runs at 28x real time with first audio in 9 to 11 ms, after a first synthesis of 20 s in which the driver compiles the shaders.
+
+Parity checks:
+
+- At temperature 0, where neither runtime draws noise, the first frame of each of the 8 replies correlates with Gradium's at 0.9998 (33 to 35 dB signal to difference, against 36 dB between Gradium's own Q8_0 and full-precision runs), and every reply ends on the same frame or one frame apart. Later frames drift apart as they do between Gradium's Q8_0 and full-precision runs, since each frame feeds the next.
+- Parakeet TDT-CTC 110M transcribes all 8 replies from the CPU and Vulkan builds as their texts, apart from number formats and one "test tasks" for "tests pass" with seed 42, which six other seeds and temperature 0 read correctly.
+- Pocket TTS output is byte-identical with the patch and without it.
+
+What the patch changes for Phonon, all of it where the GGUF has no Pocket TTS keys:
+
+- The hyperparameters come from `config.json`, and the tokenizer from `tokenizer.model`, the same SentencePiece Unigram model with byte fallback that pockettts.cpp already encodes.
+- Phonon's GELU is the exact one and its time embedding is normalized by the mean square, where Pocket uses the tanh approximation and the variance.
+- The summed conditioners (`num_speakers` 1 and `duration_delta` 0, Gradium's defaults) are a constant the reference adds to every generated frame's input, so they load as an `input_linear` bias.
+- A voice file's `speaker_wavs` latents go through the checkpoint's speaker projection and are prefilled as the voice prompt; Phonon has no Mimi encoder, so `pt_voice_from_audio` refuses.
+- Generation follows Gradium's runtime: temperature 0.3, the EOS threshold from `config.json` (4), EOS counted from the first frame, one frame fewer after it, and no frame dropped at the start of a chunk, so `patches/pockettts/0002`'s comma is not added either. `pt_tts_params.eos_threshold` now defaults to NAN for the model's own threshold, which leaves Pocket at -4.
+
 ## Changes to upstream
 
 | Patch | Why |
@@ -67,7 +96,8 @@ Size: a `hearsay-bench` with only Whisper is 2.1 MB stripped, with only Qwen3-TT
 | `patches/ggml/0001` to `0003` | The three commits pockettts.cpp's ggml fork ([ServeurpersoCom/ggml](https://github.com/ServeurpersoCom/ggml)) adds to upstream ggml, by Pascal and copied unchanged (see [License](#license)): a fused snake activation on the CPU and two `conv_1d` fixes for batched input. Both forks start from the same upstream ggml (`d7cb574` and its successor `ffa4e8b`, which changes only a release script), so these apply on top of transcribe.cpp's patched ggml. |
 | `patches/pockettts/0001-thread-count-from-POCKET_THREADS.patch` | Reads `POCKET_THREADS` for the CPU thread count instead of always using one thread per physical core, and skips `ggml_backend_load_all()` when `POCKET_STATIC` is defined so static builds do not scan the working directory for dynamic backend plugins. |
 | `patches/qwentts/0001-thread-count-from-QWEN_THREADS.patch` | The same change as `patches/pockettts/0001` for qwentts.cpp, with `QWEN_THREADS` and `QWEN_STATIC`. |
-| `patches/pockettts/0002-comma-before-every-chunk.patch` | Puts ", " before the text of every chunk. pockettts.cpp drops the audio of each chunk's first frame (80 ms), which decodes to a click, and when the voice starts at once a short first word goes with it: on 480 sentences opening with "I" (30 sentences, 16 seeds), the "I" was lost from 4.4% at the start of a text and 8.1% at the start of a later chunk, and from none of either with the comma, which adds about 0.08 s of quiet before each chunk's speech. A comma added to the text by the caller does not do this: Pocket can cut a long first sentence at it and voice it as a chunk of its own. |
+| `patches/pockettts/0002-comma-before-every-chunk.patch` | Puts ", " before the text of every chunk. pockettts.cpp drops the audio of each chunk's first frame (80 ms), which decodes to a click, and when the voice starts at once a short first word goes with it: on 480 sentences opening with "I" (30 sentences, 16 seeds), the "I" was lost from 4.4% at the start of a text and 8.1% at the start of a later chunk, and from none of either with the comma, which adds about 0.08 s of quiet before each chunk's speech. A comma added to the text by the caller does not do this: Pocket can cut a long first sentence at it and voice it as a chunk of its own. Phonon models keep every frame, as Gradium's runtime does, and get no comma. |
+| `patches/pockettts/0003-gradium-phonon.patch` | Loads Gradium's Phonon models as published (`model.q8.gguf` with `config.json` and `tokenizer.model` beside it) and their speaker latent voices, and generates as Gradium's runtime does. See [Phonon](#phonon-against-gradiums-runtime). |
 
 `src/no-bin-loaders.cpp` stands in for the functions transcribe.cpp's shared loader calls for whisper.cpp-format `.bin` files and for the development tensor dumper in `transcribe-debug.cpp`. Whisper's and Silero VAD's `.bin` loaders return `TRANSCRIBE_ERR_NOT_IMPLEMENTED` unless `-Dwhisper` or `-Dsilero` builds that family, whose own loader then reads them; `transcribe-debug.cpp` is omitted, and so is `transcribe-bin-loader.cpp` without Whisper. Parakeet's model code links the Sortformer diarizer for its multi-speaker variant, so that family is compiled as is.
 
@@ -86,7 +116,7 @@ hearsay is scoped to speech (`hear` for speech recognition and `say` for speech 
 
 ## Build
 
-Callers can opt in by capability (`-Dhear=true` for default Parakeet speech recognition, `-Dsay=true` for default Pocket TTS speech synthesis) or by individual model family (`-Dparakeet=true`, `-Dwhisper=true`, `-Dpockettts=true`, `-Dqwentts=true`, `-Dsilero=true` for Silero VAD), compiling and linking only the directions or model families they use. Whisper adds `transcribe/whisper.h` beside `transcribe.h`, Silero `transcribe/vad.h`, and Qwen3-TTS `qwen.h` (with `QWEN_STATIC` defined). qwentts.cpp is a lazy dependency, fetched only by builds that ask for it.
+Callers can opt in by capability (`-Dhear=true` for default Parakeet speech recognition, `-Dsay=true` for default Pocket TTS speech synthesis) or by individual model family (`-Dparakeet=true`, `-Dwhisper=true`, `-Dpockettts=true`, `-Dqwentts=true`, `-Dsilero=true` for Silero VAD), compiling and linking only the directions or model families they use. Phonon comes with Pocket TTS, in the same library (`pocket.h`): `pt_init` loads a Phonon model when its GGUF has no Pocket TTS keys, and `pt_voice_load` then reads a voice of phonon-voices. Whisper adds `transcribe/whisper.h` beside `transcribe.h`, Silero `transcribe/vad.h`, and Qwen3-TTS `qwen.h` (with `QWEN_STATIC` defined). qwentts.cpp is a lazy dependency, fetched only by builds that ask for it.
 
 With Zig 0.17.0:
 
@@ -126,6 +156,7 @@ cmake --build build -j
 ```sh
 zig-out/bin/hearsay-bench hear parakeet-tdt_ctc-110m-Q4_K_M.gguf 1 wavs.txt
 zig-out/bin/hearsay-bench say pocket-tts-english_2026-09-Q8_0.gguf pocket-tts-english_2026-09-voices.gguf alba 1 texts.txt out/say
+zig-out/bin/hearsay-bench say phonon-31m-en/model.q8.gguf phonon-31m-en/delia.safetensors delia 2 texts.txt out/phonon
 zig-out/bin/hearsay-bench qwen qwen-talker-1.7b-base-Q8_0.gguf qwen-tokenizer-12hz-Q8_0.gguf voice.wav 8 texts.txt out/qwen
 ```
 
@@ -133,7 +164,7 @@ zig-out/bin/hearsay-bench qwen qwen-talker-1.7b-base-Q8_0.gguf qwen-tokenizer-12
 
 Both run on the best device the build has, and print the recognition backend in their first line; `GGML_DISABLE_VULKAN=1` keeps them on the CPU. The voices argument can also be one voice's `.safetensors` file.
 
-The models are [parakeet-tdt_ctc-110m-Q4_K_M.gguf](https://huggingface.co/handy-computer/parakeet-tdt_ctc-110m-gguf), the [Pocket TTS GGUFs](https://huggingface.co/Serveurperso/pocket-tts-GGUF), the [Whisper GGUFs](https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf) converted for transcribe.cpp or [whisper.cpp's `.bin` files](https://huggingface.co/ggerganov/whisper.cpp), and the [Qwen3-TTS GGUFs](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF), a talker and the 12 Hz tokenizer.
+The models are [parakeet-tdt_ctc-110m-Q4_K_M.gguf](https://huggingface.co/handy-computer/parakeet-tdt_ctc-110m-gguf), the [Pocket TTS GGUFs](https://huggingface.co/Serveurperso/pocket-tts-GGUF), Phonon's `model.q8.gguf`, `config.json` and `tokenizer.model` from [phonon-31m-en](https://huggingface.co/gradium/phonon-31m-en), in one folder, with a voice file from phonon-voices (Delia is `voices/nGzMHMPAWGaJFHOo.safetensors`), the [Whisper GGUFs](https://huggingface.co/handy-computer/whisper-large-v3-turbo-gguf) converted for transcribe.cpp or [whisper.cpp's `.bin` files](https://huggingface.co/ggerganov/whisper.cpp), and the [Qwen3-TTS GGUFs](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF), a talker and the 12 Hz tokenizer.
 
 ### GPU
 
@@ -147,13 +178,13 @@ The compiled shaders make `hearsay-bench` 46 MB instead of 2.3 MB. On an RTX 308
 
 ## Limitations
 
-- Only the model families named above are built: Parakeet and Whisper for recognition, Pocket TTS and Qwen3-TTS for synthesis and Silero for speech detection. Other transcribe.cpp families are not.
-- The GPU build supports Vulkan only, and needs glslc to build. The CMake build is CPU only and has only Parakeet and Pocket TTS.
+- Only the model families named above are built: Parakeet and Whisper for recognition, Pocket TTS, Phonon and Qwen3-TTS for synthesis and Silero for speech detection. Other transcribe.cpp families are not.
+- The GPU build supports Vulkan only, and needs glslc to build. The CMake build is CPU only and has only Parakeet and Pocket TTS, with Phonon.
 - Speed and parity were measured on one machine, a Ryzen 7 3800XT, plus an RTX 3080 for the GPU figures.
 
 ## Development checks
 
-`tests/smoke.sh` builds hearsay with every model family, downloads Parakeet TDT-CTC 110M, Whisper tiny.en (as a GGUF and as a whisper.cpp `.bin`), Pocket TTS and Qwen3-TTS 0.6B custom-voice Q4_K_M into `.models` (or `$HEARSAY_MODELS`) at pinned commits, checks their SHA-256, and checks that Parakeet and both Whisper files transcribe `tests/utterance.wav` and that Pocket and Qwen3-TTS speak a sentence. Extra arguments go to `zig build`, such as `tests/smoke.sh -Dgpu=vulkan`. CI runs it on Linux, Windows and macOS, the Vulkan build on Linux (where, without a GPU, it falls back to the CPU), a cross-build for Windows from Linux, and the CMake build.
+`tests/smoke.sh` builds hearsay with every model family, downloads Parakeet TDT-CTC 110M, Whisper tiny.en (as a GGUF and as a whisper.cpp `.bin`), Pocket TTS, Phonon 31M with the Delia voice and Qwen3-TTS 0.6B custom-voice Q4_K_M into `.models` (or `$HEARSAY_MODELS`) at pinned commits, checks their SHA-256, and checks that Parakeet and both Whisper files transcribe `tests/utterance.wav` and that Pocket, Phonon and Qwen3-TTS speak a sentence. Extra arguments go to `zig build`, such as `tests/smoke.sh -Dgpu=vulkan`. CI runs it on Linux, Windows and macOS, the Vulkan build on Linux (where, without a GPU, it falls back to the CPU), a cross-build for Windows from Linux, and the CMake build.
 
 ## License
 
@@ -163,4 +194,4 @@ hearsay's own files, and the patches in `patches/transcribe/`, `patches/pockettt
 
 `tests/utterance.wav` is utterance 1089-134686-0010 of LibriSpeech test-clean, by Vassil Panayotov, Guoguo Chen, Daniel Povey and Sanjeev Khudanpur ([LibriSpeech](https://www.openslr.org/12), 2015), under [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/). It was converted from FLAC to a 16-bit WAV at its original 16 kHz, without trimming.
 
-The models are not part of hearsay. The Parakeet and Pocket TTS weights are CC-BY-4.0, and Kyutai's terms for Pocket TTS prohibit cloning a voice without consent and deceptive use; Silero VAD's and Whisper's are MIT, and Qwen3-TTS's Apache-2.0.
+The models are not part of hearsay. The Parakeet and Pocket TTS weights are CC-BY-4.0, and Kyutai's terms for Pocket TTS prohibit cloning a voice without consent and deceptive use; Silero VAD's and Whisper's are MIT, and Phonon's, its voices' and Qwen3-TTS's Apache-2.0.
