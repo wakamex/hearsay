@@ -24,61 +24,83 @@ index 313c96e..1dc5088 100644
  
  TRANSCRIBE_API void transcribe_token_init(struct transcribe_token * out);
 diff --git a/src/arch/parakeet/decoder.cpp b/src/arch/parakeet/decoder.cpp
-index 52defc3..5a262ea 100644
+index 52defc3..bf6b994 100644
 --- a/src/arch/parakeet/decoder.cpp
 +++ b/src/arch/parakeet/decoder.cpp
-@@ -978,6 +978,27 @@ int argmax_range(const float * data, int n) {
+@@ -978,13 +978,26 @@ int argmax_range(const float * data, int n) {
  // The result lives in [0, 1] modulo the +1e-10 epsilon (which
  // matches the reference verbatim, including its slight
  // negative-bias for nearly-uniform distributions).
-+// hearsay: the raw joint scores of an emitted token, read off the same
-+// token logits token_confidence takes.
-+static void token_scores(const float * token_logits, int n_token_classes, int token, int blank, TdtToken & tok) {
-+    float max_logit = token_logits[0];
+-float token_confidence(const float * token_logits, int n_token_classes, std::vector<float> & scratch_probs) {
++//
++// hearsay: it also gives `tok` the raw scores of the emitted `token`, read
++// off the same passes: its own, `blank`'s, the best other non-blank one and
++// the log-sum-exp of them all.
++float token_confidence(const float *        token_logits,
++                       int                  n_token_classes,
++                       std::vector<float> & scratch_probs,
++                       int                  token,
++                       int                  blank,
++                       TdtToken &           tok) {
+     // Numerically stable softmax: subtract max before exp.
+     float max_logit = token_logits[0];
+-    for (int i = 1; i < n_token_classes; ++i) {
 +    float runner_up = -INFINITY;
 +    for (int i = 0; i < n_token_classes; ++i) {
-+        max_logit = std::max(max_logit, token_logits[i]);
-+        if (i != token && i != blank) {
-+            runner_up = std::max(runner_up, token_logits[i]);
+         if (token_logits[i] > max_logit) {
+             max_logit = token_logits[i];
+         }
++        if (i != token && i != blank && token_logits[i] > runner_up) {
++            runner_up = token_logits[i];
 +        }
-+    }
-+    double sum_exp = 0.0;
-+    for (int i = 0; i < n_token_classes; ++i) {
-+        sum_exp += std::exp(static_cast<double>(token_logits[i] - max_logit));
-+    }
+     }
+     if (static_cast<int>(scratch_probs.size()) < n_token_classes) {
+         scratch_probs.resize(static_cast<size_t>(n_token_classes));
+@@ -995,6 +1008,10 @@ float token_confidence(const float * token_logits, int n_token_classes, std::vec
+         scratch_probs[static_cast<size_t>(i)] = e;
+         sum_exp += static_cast<double>(e);
+     }
 +    tok.logit           = token_logits[token];
 +    tok.blank_logit     = token_logits[blank];
 +    tok.runner_up_logit = runner_up;
 +    tok.logsumexp       = max_logit + static_cast<float>(std::log(sum_exp));
-+}
-+
- float token_confidence(const float * token_logits, int n_token_classes, std::vector<float> & scratch_probs) {
-     // Numerically stable softmax: subtract max before exp.
-     float max_logit = token_logits[0];
-@@ -1167,6 +1188,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+     const float inv_sum = static_cast<float>(1.0 / sum_exp);
+     double      entropy = 0.0;
+     for (int i = 0; i < n_token_classes; ++i) {
+@@ -1160,9 +1177,9 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+         const bool is_blank = (pred_token == blank_id);
+         if (!is_blank) {
+             const int64_t tc0 = ggml_time_us();
+-            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs);
++            TdtToken      tok;
++            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs, pred_token, blank_id, tok);
+             t_conf_us += ggml_time_us() - tc0;
+-            TdtToken tok;
+             tok.id              = pred_token;
              tok.p               = p;
              tok.step_at_emit    = step;
-             tok.duration_frames = duration;
-+            token_scores(token_logits, n_token_cls, pred_token, blank_id, tok);
-             out_tokens.push_back(tok);
- 
-             last_token = pred_token;
-@@ -1372,6 +1394,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
+@@ -1365,9 +1382,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
+             new_symbols = 0;
+         } else {
+             const int64_t tc0 = ggml_time_us();
+-            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs);
++            TdtToken      tok;
++            const float   p   = token_confidence(token_logits, n_token_cls, scratch_probs, pred_token, blank_id, tok);
+             t_conf_us += ggml_time_us() - tc0;
+-            TdtToken tok;
+             tok.id              = pred_token;
              tok.p               = p;
              tok.step_at_emit    = step;
-             tok.duration_frames = 1;
-+            token_scores(token_logits, n_token_cls, pred_token, blank_id, tok);
-             out_tokens.push_back(tok);
- 
-             last_token = pred_token;
-@@ -1533,6 +1556,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
+@@ -1527,8 +1544,8 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
+             step += 1;
+             new_symbols = 0;
+         } else {
+-            const float p = token_confidence(token_logits, n_token_cls, scratch_probs);
+             TdtToken    tok;
++            const float p = token_confidence(token_logits, n_token_cls, scratch_probs, pred_token, blank_id, tok);
+             tok.id              = pred_token;
              tok.p               = p;
              tok.step_at_emit    = frame_offset + step;
-             tok.duration_frames = 1;
-+            token_scores(token_logits, n_token_cls, pred_token, blank_id, tok);
-             out_tokens.push_back(tok);
- 
-             last_token = pred_token;
 diff --git a/src/arch/parakeet/decoder.h b/src/arch/parakeet/decoder.h
 index e7cb70a..bb46004 100644
 --- a/src/arch/parakeet/decoder.h
