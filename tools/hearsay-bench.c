@@ -6,7 +6,9 @@
 //       Transcribes each 16 kHz mono WAV named in LIST (one path per line) in
 //       English, with a Parakeet or Whisper model.
 //       Prints one JSON object per line: a header with the load time, then
-//       {"file", "text", "total_ms"} per file.
+//       {"file", "text", "total_ms", "tokens"} per file. Each token is
+//       [id, p, logit, blank_logit, runner_up_logit, logsumexp], the last
+//       four null where the model does not report them (all but Parakeet TDT).
 //   hearsay-bench say MODEL VOICES VOICE THREADS TEXTS OUT_PREFIX
 //       VOICES is a voices file holding VOICE, or one voice's .safetensors file.
 //       Synthesizes each line of TEXTS twice with seed 42, the first pass to
@@ -40,6 +42,7 @@
 #include "dr_wav.h"
 #endif
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -133,7 +136,23 @@ static int hear(const char * model, int threads, const char * list) {
         json_string(path);
         printf(", \"text\": ");
         json_string(transcribe_full_text(session));
-        printf(", \"total_ms\": %.1f}\n", ms);
+        printf(", \"total_ms\": %.1f, \"tokens\": [", ms);
+        for (int i = 0; i < transcribe_n_tokens(session); i++) {
+            struct transcribe_token tk;
+            transcribe_token_init(&tk);
+            transcribe_get_token(session, i, &tk);
+            printf("%s[%d, %.4f", i ? ", " : "", tk.id, tk.p);
+            const float scores[4] = { tk.logit, tk.blank_logit, tk.runner_up_logit, tk.logsumexp };
+            for (int k = 0; k < 4; k++) {
+                if (isnan(scores[k])) {
+                    printf(", null");
+                } else {
+                    printf(", %.4f", scores[k]);
+                }
+            }
+            printf("]");
+        }
+        printf("]}\n");
     }
     fclose(f);
     transcribe_close(session);

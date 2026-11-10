@@ -1,0 +1,187 @@
+diff --git a/include/transcribe.h b/include/transcribe.h
+index 313c96e..1dc5088 100644
+--- a/include/transcribe.h
++++ b/include/transcribe.h
+@@ -2607,6 +2607,20 @@ struct transcribe_token {
+     int          seg_index;
+     int          word_index;
+     const char * text; /* session-owned; see lifetime note above */
++
++    /*
++     * hearsay addition: the joint network's raw scores at the decoder step
++     * that emitted the token, before any softmax, for Parakeet TDT decoding
++     * (NAN for other families and for CTC decoding): the token's own score,
++     * blank's, the best other non-blank token's, and the log-sum-exp over
++     * every token class, blank included, so logit - logsumexp is the token's
++     * log-probability. A caller whose struct_size ends before these fields
++     * gets the struct above unchanged.
++     */
++    float logit;
++    float blank_logit;
++    float runner_up_logit;
++    float logsumexp;
+ };
+ 
+ TRANSCRIBE_API void transcribe_token_init(struct transcribe_token * out);
+diff --git a/src/arch/parakeet/decoder.cpp b/src/arch/parakeet/decoder.cpp
+index 52defc3..5a262ea 100644
+--- a/src/arch/parakeet/decoder.cpp
++++ b/src/arch/parakeet/decoder.cpp
+@@ -978,6 +978,27 @@ int argmax_range(const float * data, int n) {
+ // The result lives in [0, 1] modulo the +1e-10 epsilon (which
+ // matches the reference verbatim, including its slight
+ // negative-bias for nearly-uniform distributions).
++// hearsay: the raw joint scores of an emitted token, read off the same
++// token logits token_confidence takes.
++static void token_scores(const float * token_logits, int n_token_classes, int token, int blank, TdtToken & tok) {
++    float max_logit = token_logits[0];
++    float runner_up = -INFINITY;
++    for (int i = 0; i < n_token_classes; ++i) {
++        max_logit = std::max(max_logit, token_logits[i]);
++        if (i != token && i != blank) {
++            runner_up = std::max(runner_up, token_logits[i]);
++        }
++    }
++    double sum_exp = 0.0;
++    for (int i = 0; i < n_token_classes; ++i) {
++        sum_exp += std::exp(static_cast<double>(token_logits[i] - max_logit));
++    }
++    tok.logit           = token_logits[token];
++    tok.blank_logit     = token_logits[blank];
++    tok.runner_up_logit = runner_up;
++    tok.logsumexp       = max_logit + static_cast<float>(std::log(sum_exp));
++}
++
+ float token_confidence(const float * token_logits, int n_token_classes, std::vector<float> & scratch_probs) {
+     // Numerically stable softmax: subtract max before exp.
+     float max_logit = token_logits[0];
+@@ -1167,6 +1188,7 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
+             tok.p               = p;
+             tok.step_at_emit    = step;
+             tok.duration_frames = duration;
++            token_scores(token_logits, n_token_cls, pred_token, blank_id, tok);
+             out_tokens.push_back(tok);
+ 
+             last_token = pred_token;
+@@ -1372,6 +1394,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
+             tok.p               = p;
+             tok.step_at_emit    = step;
+             tok.duration_frames = 1;
++            token_scores(token_logits, n_token_cls, pred_token, blank_id, tok);
+             out_tokens.push_back(tok);
+ 
+             last_token = pred_token;
+@@ -1533,6 +1556,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
+             tok.p               = p;
+             tok.step_at_emit    = frame_offset + step;
+             tok.duration_frames = 1;
++            token_scores(token_logits, n_token_cls, pred_token, blank_id, tok);
+             out_tokens.push_back(tok);
+ 
+             last_token = pred_token;
+diff --git a/src/arch/parakeet/decoder.h b/src/arch/parakeet/decoder.h
+index e7cb70a..bb46004 100644
+--- a/src/arch/parakeet/decoder.h
++++ b/src/arch/parakeet/decoder.h
+@@ -31,6 +31,7 @@
+ #include "ggml.h"
+ #include "transcribe.h"
+ 
++#include <cmath>
+ #include <cstdint>
+ #include <string>
+ #include <vector>
+@@ -201,6 +202,13 @@ struct TdtToken {
+     float p               = 0.0f;  // entropy-based confidence
+     int   step_at_emit    = 0;
+     int   duration_frames = 0;
++    // hearsay: the joint's raw scores at the step that emitted the token
++    // (TDT decoding; NAN otherwise): the token's, blank's, the best other
++    // non-blank token's, and the log-sum-exp over every token class.
++    float logit           = NAN;
++    float blank_logit     = NAN;
++    float runner_up_logit = NAN;
++    float logsumexp       = NAN;
+ };
+ 
+ // Run TDT greedy decode end-to-end against an encoder output buffer.
+diff --git a/src/arch/parakeet/model.cpp b/src/arch/parakeet/model.cpp
+index 0c3da17..f787478 100644
+--- a/src/arch/parakeet/model.cpp
++++ b/src/arch/parakeet/model.cpp
+@@ -895,6 +895,10 @@ transcribe_status build_result_from_raw_tokens(ParakeetSession *             pc,
+         transcribe_session::TokenEntry te;
+         te.id                  = rt.id;
+         te.p                   = rt.p;
++        te.logit               = rt.logit;
++        te.blank_logit         = rt.blank_logit;
++        te.runner_up_logit     = rt.runner_up_logit;
++        te.logsumexp           = rt.logsumexp;
+         te.t0_ms               = static_cast<int64_t>(std::llround(frame_to_ms * static_cast<double>(rt.step_at_emit)));
+         // duration_frames=0 yields a zero-width "point in time" token.
+         const double end_frame = static_cast<double>(rt.step_at_emit) + static_cast<double>(rt.duration_frames);
+@@ -2778,6 +2782,10 @@ void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * p
+         transcribe_session::TokenEntry te;
+         te.id    = tk.id;
+         te.p     = tk.p;
++        te.logit           = tk.logit;
++        te.blank_logit     = tk.blank_logit;
++        te.runner_up_logit = tk.runner_up_logit;
++        te.logsumexp       = tk.logsumexp;
+         te.t0_ms = static_cast<int64_t>(std::llround(frame_to_ms * static_cast<double>(tk.step_at_emit)));
+         te.t1_ms =
+             static_cast<int64_t>(std::llround(frame_to_ms * static_cast<double>(tk.step_at_emit + tk.duration_frames)));
+diff --git a/src/transcribe-asr.cpp b/src/transcribe-asr.cpp
+index ffbfa0c..397709f 100644
+--- a/src/transcribe-asr.cpp
++++ b/src/transcribe-asr.cpp
+@@ -2020,7 +2020,11 @@ extern "C" transcribe_status transcribe_get_token(const struct transcribe_sessio
+     staged.t1_ms       = t.t1_ms;
+     staged.seg_index   = t.seg_index;
+     staged.word_index  = t.word_index;
+-    staged.text        = t.text.c_str();
++    staged.text            = t.text.c_str();
++    staged.logit           = t.logit;
++    staged.blank_logit     = t.blank_logit;
++    staged.runner_up_logit = t.runner_up_logit;
++    staged.logsumexp       = t.logsumexp;
+     copy_out_prefix(out, &staged, caller_size, sizeof(staged));
+     return TRANSCRIBE_OK;
+ }
+@@ -2254,7 +2258,11 @@ extern "C" transcribe_status transcribe_batch_get_token(const struct transcribe_
+     staged.t1_ms       = t.t1_ms;
+     staged.seg_index   = t.seg_index;
+     staged.word_index  = t.word_index;
+-    staged.text        = t.text.c_str();
++    staged.text            = t.text.c_str();
++    staged.logit           = t.logit;
++    staged.blank_logit     = t.blank_logit;
++    staged.runner_up_logit = t.runner_up_logit;
++    staged.logsumexp       = t.logsumexp;
+     copy_out_prefix(out, &staged, caller_size, sizeof(staged));
+     return TRANSCRIBE_OK;
+ }
+diff --git a/src/transcribe-session.h b/src/transcribe-session.h
+index 8f4ff96..b430365 100644
+--- a/src/transcribe-session.h
++++ b/src/transcribe-session.h
+@@ -13,6 +13,7 @@
+ #include "transcribe-session-core.h"
+ #include "transcribe.h"
+ 
++#include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+ #include <deque>
+@@ -79,6 +80,11 @@ struct transcribe_session : transcribe::SessionCore {
+         int64_t     t1_ms      = 0;
+         int         seg_index  = 0;
+         int         word_index = -1;
++        // hearsay: the raw joint scores of a Parakeet TDT token, NAN otherwise
++        float logit           = NAN;
++        float blank_logit     = NAN;
++        float runner_up_logit = NAN;
++        float logsumexp       = NAN;
+     };
+ 
+     struct WordEntry {

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Builds hearsay with every model family, then checks each on real models: Parakeet and Whisper (from
 # a GGUF and from a whisper.cpp .bin file) transcribe tests/utterance.wav (LibriSpeech test-clean
-# 1089-134686-0010, CC-BY-4.0), and Pocket, Phonon (voice Delia) and Qwen3-TTS speak one sentence. The models are
-# downloaded once into $HEARSAY_MODELS (default .models), pinned by commit and checked by SHA-256.
+# 1089-134686-0010, CC-BY-4.0), with Parakeet's raw token scores, and Pocket, Phonon (voice Delia) and
+# Qwen3-TTS speak one sentence. The models are downloaded once into $HEARSAY_MODELS (default .models),
+# pinned by commit and checked by SHA-256.
 #   tests/smoke.sh [zig build options...]
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -60,6 +61,8 @@ for model in parakeet-tdt_ctc-110m-Q4_K_M.gguf whisper-tiny.en-Q8_0.gguf ggml-ti
     heard=$(run hear "$models/$model" 2 "$out/wavs.txt" | tail -n 1)
     echo "heard ($model): $heard"
     case "$heard" in *declare*stick*) ;; *) echo "error: $model's transcript is not the recording's" >&2; exit 1 ;; esac
+    # Parakeet TDT reports the joint's raw scores for every token.
+    case "$model:$heard" in parakeet*null*) echo "error: Parakeet left a token's scores out" >&2; exit 1 ;; esac
 done
 
 echo "I found the bug in the parser." > "$out/texts.txt"

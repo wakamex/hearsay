@@ -191,29 +191,47 @@ pub fn build(b: *std.Build) void {
     const lib = b.addLibrary(.{ .name = "hearsay", .linkage = .static, .root_module = mod });
 
     if (transcribe) {
-        const patch_tr_arch = @embedFile("patches/transcribe/0001-register-only-built-families.patch");
-        const patch_tr_io = @embedFile("patches/transcribe/0002-stdio-file-io.patch");
-        const tr_arch_cpp = wf.add("transcribe-arch.cpp", patchFile(b, tr_dep, "", "src/transcribe-arch.cpp", &.{patch_tr_arch}));
-        _ = wf.add("transcribe-path.h", patchFile(b, tr_dep, "", "src/transcribe-path.h", &.{patch_tr_io}));
-        const tr_cpp = wf.add("transcribe.cpp", patchFile(b, tr_dep, "", "src/transcribe.cpp", &.{patch_tr_io}));
-        const tr_load_common_cpp = wf.add("transcribe-load-common.cpp", patchFile(b, tr_dep, "", "src/transcribe-load-common.cpp", &.{patch_tr_io}));
-        const tr_loader_cpp = wf.addCopyFile(tr.path(b, "src/transcribe-loader.cpp"), "transcribe-loader.cpp");
+        // A copy of transcribe.cpp's sources with every patched file in place, since its sources
+        // include each other's headers from beside them.
+        const PatchedFile = struct { path: []const u8, patches: []const []const u8 };
+        const tr_arch = @embedFile("patches/transcribe/0001-register-only-built-families.patch");
+        const tr_io = @embedFile("patches/transcribe/0002-stdio-file-io.patch");
+        const tr_scores = @embedFile("patches/transcribe/0005-parakeet-joint-scores.patch");
+        const tr_patched = [_]PatchedFile{
+            .{ .path = "transcribe-arch.cpp", .patches = &.{tr_arch} },
+            .{ .path = "transcribe-path.h", .patches = &.{tr_io} },
+            .{ .path = "transcribe.cpp", .patches = &.{tr_io} },
+            .{ .path = "transcribe-load-common.cpp", .patches = &.{tr_io} },
+            .{ .path = "arch/silero_vad/model.cpp", .patches = &.{@embedFile("patches/transcribe/0003-silero-stdio-file-io.patch")} },
+            .{ .path = "transcribe-bin-loader.cpp", .patches = &.{@embedFile("patches/transcribe/0004-whisper-bin-stdio-file-io.patch")} },
+            .{ .path = "transcribe-session.h", .patches = &.{tr_scores} },
+            .{ .path = "transcribe-asr.cpp", .patches = &.{tr_scores} },
+            .{ .path = "arch/parakeet/decoder.h", .patches = &.{tr_scores} },
+            .{ .path = "arch/parakeet/decoder.cpp", .patches = &.{tr_scores} },
+            .{ .path = "arch/parakeet/model.cpp", .patches = &.{tr_scores} },
+        };
+        var tr_excluded: [tr_patched.len][]const u8 = undefined;
+        for (tr_patched, 0..) |f, i| tr_excluded[i] = f.path;
+        const twf = b.addWriteFiles();
+        _ = twf.addCopyDirectory(tr.path(b, "src"), "", .{ .exclude_extensions = &tr_excluded });
+        for (tr_patched) |f| _ = twf.add(f.path, patchFile(b, tr_dep, "", b.fmt("src/{s}", .{f.path}), f.patches));
+        const trs = twf.getDirectory();
+        const transcribe_h = wf.add("include/transcribe.h", b.fmt("#ifndef TRANSCRIBE_STATIC\n#define TRANSCRIBE_STATIC 1\n#endif\n{s}", .{patchFile(b, tr_dep, "", "include/transcribe.h", &.{tr_scores})}));
 
+        mod.addIncludePath(wf.getDirectory().path(b, "include"));
         mod.addIncludePath(tr.path(b, "include"));
-        mod.addIncludePath(tr.path(b, "src"));
+        mod.addIncludePath(trs);
         var arch_flags: std.ArrayList([]const u8) = .empty;
         arch_flags.appendSlice(b.allocator, cxx_noexcept_list.items) catch @panic("OOM");
         if (parakeet) arch_flags.append(b.allocator, "-DHEARSAY_PARAKEET") catch @panic("OOM");
         if (whisper) arch_flags.append(b.allocator, "-DHEARSAY_WHISPER") catch @panic("OOM");
         if (silero) arch_flags.append(b.allocator, "-DHEARSAY_SILERO") catch @panic("OOM");
-        mod.addCSourceFile(.{ .file = tr_arch_cpp, .flags = arch_flags.items });
-        mod.addCSourceFile(.{ .file = tr_loader_cpp, .flags = cxx_noexcept_list.items });
-        mod.addCSourceFile(.{ .file = tr_cpp, .flags = cxx_flag_list.items });
-        mod.addCSourceFile(.{ .file = tr_load_common_cpp, .flags = cxx_flag_list.items });
+        mod.addCSourceFile(.{ .file = trs.path(b, "transcribe-arch.cpp"), .flags = arch_flags.items });
         mod.addCSourceFile(.{ .file = b.path("src/no-bin-loaders.cpp"), .flags = arch_flags.items });
         mod.addCSourceFiles(.{
-            .root = tr.path(b, "src"),
+            .root = trs,
             .files = &.{
+                "transcribe-loader.cpp",
                 "transcribe-meta.cpp",
                 "transcribe-kaldi-fbank.cpp",
                 "transcribe-model.cpp",
@@ -227,9 +245,9 @@ pub fn build(b: *std.Build) void {
             .flags = cxx_noexcept_list.items,
         });
         // Parakeet's and Whisper's encoders share transcribe.cpp's conformer helpers.
-        if (parakeet or whisper) mod.addCSourceFile(.{ .file = tr.path(b, "src/conformer/conformer.cpp"), .flags = cxx_noexcept_list.items });
+        if (parakeet or whisper) mod.addCSourceFile(.{ .file = trs.path(b, "conformer/conformer.cpp"), .flags = cxx_noexcept_list.items });
         if (parakeet) mod.addCSourceFiles(.{
-            .root = tr.path(b, "src"),
+            .root = trs,
             .files = &.{
                 "arch/parakeet/model.cpp",
                 "arch/parakeet/longform.cpp",
@@ -245,8 +263,10 @@ pub fn build(b: *std.Build) void {
             .flags = cxx_noexcept_list.items,
         });
         mod.addCSourceFiles(.{
-            .root = tr.path(b, "src"),
+            .root = trs,
             .files = &.{
+                "transcribe.cpp",
+                "transcribe-load-common.cpp",
                 "transcribe-asr.cpp",
                 "transcribe-diarize.cpp",
                 "transcribe-langid.cpp",
@@ -259,15 +279,13 @@ pub fn build(b: *std.Build) void {
             .flags = cxx_flag_list.items,
         });
         if (whisper) {
-            const patch_bin_io = @embedFile("patches/transcribe/0004-whisper-bin-stdio-file-io.patch");
-            const bin_loader_cpp = wf.add("transcribe-bin-loader.cpp", patchFile(b, tr_dep, "", "src/transcribe-bin-loader.cpp", &.{patch_bin_io}));
-            mod.addCSourceFile(.{ .file = bin_loader_cpp, .flags = cxx_noexcept_list.items });
+            mod.addCSourceFile(.{ .file = trs.path(b, "transcribe-bin-loader.cpp"), .flags = cxx_noexcept_list.items });
             // miniz compresses the decoded tokens for Whisper's compression-ratio check; its trimming
             // flags are transcribe.cpp's, and reach miniz.c and its one user, model.cpp.
             const miniz_flags: []const []const u8 = &.{ "-DMINIZ_NO_INFLATE_APIS", "-DMINIZ_NO_STDIO", "-DMINIZ_NO_TIME", "-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES" };
             const whisper_flags = std.mem.concat(b.allocator, []const u8, &.{ arch_flags.items, miniz_flags }) catch @panic("OOM");
             mod.addCSourceFiles(.{
-                .root = tr.path(b, "src"),
+                .root = trs,
                 .files = &.{
                     "arch/whisper/model.cpp",
                     "arch/whisper/capabilities.cpp",
@@ -279,21 +297,17 @@ pub fn build(b: *std.Build) void {
                 },
                 .flags = whisper_flags,
             });
-            mod.addCSourceFile(.{ .file = tr.path(b, "src/third_party/miniz/miniz.c"), .flags = std.mem.concat(b.allocator, []const u8, &.{ c_flag_list.items, miniz_flags }) catch @panic("OOM") });
+            mod.addCSourceFile(.{ .file = trs.path(b, "third_party/miniz/miniz.c"), .flags = std.mem.concat(b.allocator, []const u8, &.{ c_flag_list.items, miniz_flags }) catch @panic("OOM") });
             lib.installHeader(tr.path(b, "include/transcribe/whisper.h"), "transcribe/whisper.h");
         }
         if (silero) {
-            const patch_silero_io = @embedFile("patches/transcribe/0003-silero-stdio-file-io.patch");
-            const silero_model_cpp = wf.add("silero-vad-model.cpp", patchFile(b, tr_dep, "", "src/arch/silero_vad/model.cpp", &.{patch_silero_io}));
-            mod.addIncludePath(tr.path(b, "src/arch/silero_vad"));
-            mod.addCSourceFile(.{ .file = silero_model_cpp, .flags = cxx_noexcept_list.items });
             mod.addCSourceFiles(.{
-                .root = tr.path(b, "src/arch/silero_vad"),
-                .files = &.{ "weights.cpp", "encoder.cpp", "decoder.cpp" },
+                .root = trs,
+                .files = &.{ "arch/silero_vad/model.cpp", "arch/silero_vad/weights.cpp", "arch/silero_vad/encoder.cpp", "arch/silero_vad/decoder.cpp" },
                 .flags = cxx_noexcept_list.items,
             });
         }
-        lib.installHeader(wf.add("include/transcribe.h", staticHeader(b, tr_dep, "include/transcribe.h", "TRANSCRIBE_STATIC")), "transcribe.h");
+        lib.installHeader(transcribe_h, "transcribe.h");
         if (silero) lib.installHeader(tr.path(b, "include/transcribe/vad.h"), "transcribe/vad.h");
     }
 
