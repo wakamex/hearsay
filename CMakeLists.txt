@@ -40,6 +40,8 @@ FetchContent_Declare(transcribe
                        ${CMAKE_SOURCE_DIR}/patches/transcribe/0001-register-only-built-families.patch
                        ${CMAKE_SOURCE_DIR}/patches/transcribe/0002-stdio-file-io.patch
                        ${CMAKE_SOURCE_DIR}/patches/transcribe/0003-silero-stdio-file-io.patch
+                       ${CMAKE_SOURCE_DIR}/patches/transcribe/0004-whisper-bin-stdio-file-io.patch
+                       ${CMAKE_SOURCE_DIR}/patches/transcribe/0005-parakeet-joint-scores.patch
           COMMAND  git apply --directory=ggml
                        ${CMAKE_SOURCE_DIR}/patches/ggml/0001-cpu-add-fused-snake-activation-mul-sin-sqr-mul-add.patch
                        ${CMAKE_SOURCE_DIR}/patches/ggml/0002-ggml-fix-conv_1d-result-layout-for-batched-input.patch

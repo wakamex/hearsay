@@ -210,8 +210,12 @@ pub fn build(b: *std.Build) void {
             .{ .path = "arch/parakeet/decoder.cpp", .patches = &.{tr_scores} },
             .{ .path = "arch/parakeet/model.cpp", .patches = &.{tr_scores} },
         };
-        var tr_excluded: [tr_patched.len][]const u8 = undefined;
-        for (tr_patched, 0..) |f, i| tr_excluded[i] = f.path;
+        // The copy matches these against paths with the host's separators.
+        var tr_excluded: [2 * tr_patched.len][]const u8 = undefined;
+        for (tr_patched, 0..) |f, i| {
+            tr_excluded[2 * i] = f.path;
+            tr_excluded[2 * i + 1] = std.mem.replaceOwned(u8, b.allocator, f.path, "/", "\\") catch @panic("OOM");
+        }
         const twf = b.addWriteFiles();
         _ = twf.addCopyDirectory(tr.path(b, "src"), "", .{ .exclude_extensions = &tr_excluded });
         for (tr_patched) |f| _ = twf.add(f.path, patchFile(b, tr_dep, "", b.fmt("src/{s}", .{f.path}), f.patches));
